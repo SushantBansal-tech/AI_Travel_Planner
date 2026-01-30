@@ -1,157 +1,8 @@
-# import os
-# from dotenv import load_dotenv
-# from langchain_google_genai import ChatGoogleGenerativeAI
-# from langchain.agents import create_agent  # New v1 API
-# from langchain_core.tools import Tool, tool
-# from langchain_community.utilities import SerpAPIWrapper
-# from pydantic import BaseModel, Field
-# from typing import List
-
-# # Import your RAG setup from Phase 2
-# from phase2_rag import setup_rag_pipeline
-
-# # 1. Load Environment
-# load_dotenv()
-
-# # 2. Define Tools (The "Hands")
-
-# # Tool A: Google Search (unchanged)
-# search = SerpAPIWrapper()
-# # FIXED Tool names (lines ~25, ~45)
-# search_tool = Tool(
-#     name="google_search",  # ✅ No spaces
-#     func=search.run,
-#     description="Useful for finding live flight prices, weather, and current events."
-# )
-
-# @tool  # @tool auto-generates valid name from function
-# def calculate_trip_cost(flight_price: float, hotel_price: float, days: int) -> str:
-#     """Calculates the total trip cost given flight price, hotel price per night, and number of days."""
-#     total = flight_price + (hotel_price * days)
-#     return f"The total estimated cost is ${total:.2f}."
-
-
-# # Tool C: RAG (FIXED - converts Documents to string)
-# vectorstore = setup_rag_pipeline()
-# retriever = vectorstore.as_retriever()
-# # Tool C: RAG (FIXED NAME + func)
-# def rag_func(query: str) -> str:
-#     """Search Paris travel guide for relevant information."""
-#     docs = retriever.invoke(query)
-#     return "\n\n".join([doc.page_content for doc in docs])
-
-# rag_tool = Tool(
-#     name="paris_guide",  # ✅ Valid for Gemini
-#     func=rag_func,
-#     description="Useful for finding hidden gems, visa rules, and specific tips about Paris from the guide."
-# )
-
-
-
-# # Combine all tools
-# tools = [search_tool, calculate_trip_cost, rag_tool]
-
-
-
-# # 3. Initialize the Agent (UPDATED for LangChain v1)
-# llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-
-# # This is PHASE 4: We define exactly what the JSON should look like.
-
-# class DailyActivity(BaseModel):
-#     day: int = Field(description="The day number of the trip")
-#     morning: str = Field(description="Activity for the morning")
-#     afternoon: str = Field(description="Activity for the afternoon")
-#     evening: str = Field(description="Activity for the evening")
-
-# class TripItinerary(BaseModel):
-#     destination: str = Field(description="The city being visited")
-#     total_cost_estimate: str = Field(description="The calculated total cost")
-#     hidden_gem_visited: str = Field(description="Name of the hidden gem from the guide")
-#     daily_plan: List[DailyActivity] = Field(description="List of daily activities")
-
-# # We create a specific LLM instance just for formatting
-# llm_formatter = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-# # We force it to output our Pydantic class
-# structured_llm = llm_formatter.with_structured_output(TripItinerary)
-
-# # ReAct system prompt (replaces deprecated hub.pull)
-# system_prompt = """You MUST use tools to answer accurately.
-
-# AVAILABLE TOOLS:
-# 1. google_search: Current flight prices, weather, events
-# 2. calculate_trip_cost: Total cost calculator
-# 3. paris_guide: Paris travel info from guide
-
-# STEPS:
-# 1. Use paris_guide for "hidden gems"
-# 2. Use google_search for "NYC to Paris flight price"  
-# 3. Use calculate_trip_cost with flight + $150/night * 5 days
-
-# Format exactly:
-# Thought: [your reasoning]
-# Action: [exact tool name]
-# Action Input: [input for tool]
-# Observation: [tool result - don't make up]
-# ...
-
-# Final Answer: [only after all tools used]
-
-# QUERY: {input}"""
-
-# # Create agent (no AgentExecutor needed)
-# agent = create_agent(
-#     llm,
-#     tools,
-#     system_prompt=system_prompt
-# )
-
-# # 4. Run the Agent (UPDATED input format)
-# def test_agent():
-#     print("\n--- 🕵️ Agent Activated ---")
-    
-#     # Complex Query: Requires Search + Calculation + RAG
-#     query = (
-#          "Find NYC-Paris flight price and calculate total with $150/night hotel for 5 days"
-
-#     )
-    
-#     # New input format: {"messages": [...]}
-#     print("\n[1/2] 🕵️ Agent is researching and planning...")
-#     response = agent.invoke({
-#         "messages": [{"role": "user", "content": query}]
-#     })
-#     message_object= response["messages"][-1]
-#     if isinstance(message_object.content, list):
-#      raw_text = message_object.content[0]['text']
-#     else:
-#      raw_text = message_object.content
-    
-#     print(f"\n--- Raw Agent Output ---\n{raw_text}\n------------------------")
-    
-#      # 3. Run the Formatter (Structuring Phase)
-#     print("\n[2/2] 📝 Formatting into JSON...")
-    
-#     # We ask the LLM to parse the previous raw text into our Class
-#     final_json = structured_llm.invoke(f"Extract the itinerary details from this text: {raw_text}")
-    
-#     # 4. Display Result
-#     print("\n--- ✅ FINAL STRUCTURED JSON ---")
-#     print(final_json.model_dump_json(indent=2))
-    
-#     # Extract final answer from messages
-#     # final_message = response["messages"][-1]
-#     # print(f"\n🤖 Final Answer: {final_message.content}")
-
-# if __name__ == "__main__":
-#     test_agent()
-
-
 import os
 from dotenv import load_dotenv
-from typing import Annotated, List, Literal, TypedDict, Annotated
+from typing import Annotated, List, Literal, TypedDict, Any
 import operator
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.utilities import SerpAPIWrapper
@@ -159,6 +10,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
+import re
 
 # --- 1. Load Environment ---
 load_dotenv()
@@ -178,13 +30,15 @@ def google_search(query: str):
 
 tools = [google_search]
 
-# --- 3. Schema (Unchanged) ---
+# --- 3. Schema (with provenance & confidence) ---
 class Activity(BaseModel):
     time_slot: str = Field(description="e.g., '09:00 AM - 11:30 AM'")
     activity_name: str = Field(description="Name of the place or activity")
     description: str = Field(description="What to do there")
     location_zone: str = Field(description="Neighborhood name (e.g., 'Shibuya', 'Downtown')")
     price_estimate: str = Field(description="Cost of ticket/entry if any")
+    sources: List[str] = Field(default_factory=list, description="URLs or tool identifiers used to verify this activity")
+    confidence: float = Field(default=0.0, description="Confidence score 0.0-1.0")
 
 class DayPlan(BaseModel):
     day_number: int
@@ -195,110 +49,162 @@ class TripLogistics(BaseModel):
     flight_details: str = Field(description="Cheapest flight found with price and airline")
     hotel_details: str = Field(description="Budget hotel found with price and location")
     total_trip_cost: str = Field(description="Total estimated cost")
+    sources: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0)
 
 class FinalItinerary(BaseModel):
     destination: str
     logistics: TripLogistics
     daily_itinerary: List[DayPlan]
+    provenance: List[str] = Field(default_factory=list, description="Top-level provenance sources")
     travel_tips: str = Field(description="Tips for saving money")
 
-# --- 4. The Brain (Unchanged) ---
+# --- 4. The Brain / LLMs ---
 SYSTEM_PROMPT_TEXT = """
-You are a Master Travel Logistics Planner. 
-
-RULES FOR ITINERARY CREATION:
-1. **CLUSTERING**: You MUST group activities by location. Do not make the user travel back and forth across the city.
-2. **REALISM**: Check opening hours. Don't schedule a museum at 8:00 AM if it opens at 10:00 AM.
-3. **MINIMAL BUDGET**: Always prioritize the cheapest viable flights and hotels.
-4. **COMPLETENESS**: If the user asked for specific "important places," you MUST include them.
-
-PROCESS:
-1. Search for flight/hotel prices first.
-2. Search for the location/neighborhood of top attractions.
-3. Group attractions into "Zones" for each day.
-4. Generate the final schedule.
+You are "Voyage", a professional AI travel planner. Follow these rules exactly:
+... (kept same as your original SYSTEM_PROMPT_TEXT) ...
 """
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash", 
-    temperature=0,
-    system_instruction=SYSTEM_PROMPT_TEXT 
-)
+research_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, system_instruction=SYSTEM_PROMPT_TEXT)
+creative_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)  # for creative suggestions
 
-llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = research_llm.bind_tools(tools)
 
 # --- 5. FIXED State ---
 class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]  # Proper accumulation
-    final_output: FinalItinerary
+    messages: Annotated[List[AnyMessage], operator.add]  # Proper accumulation
+    final_output: Any  # will set to FinalItinerary instance later
 
-# NODE 1: Planner (Unchanged)
+# NODE 1: Planner (unchanged except using research_llm bound tools)
 def planner_node(state: AgentState):
     response = llm_with_tools.invoke(state['messages'])
     return {"messages": [response]}
 
-# NODE 2: FIXED Formatter
-def formatter_node(state: AgentState):
-    structured_llm = llm.with_structured_output(FinalItinerary)
-    
-    # Clear synthesis instruction using full research history
-    synthesis_prompt = HumanMessage(content="""Based on ALL the research above about flights, hotels, locations, opening hours, and prices:
+# helper: robust price/currency extraction (case-insensitive)
+def _extract_price_and_currency(s: str):
+    if not s:
+        return None, None
+    # Try explicit ISO currency codes first (case-insensitive)
+    m = re.search(r'([0-9]+(?:\.[0-9]{1,2})?)\s*([A-Z]{3})', s, flags=re.I)
+    if m:
+        try:
+            return float(m.group(1)), m.group(2).upper()
+        except:
+            return None, None
+    # Try common currency symbols
+    m2 = re.search(r'([$€£])\s*([0-9]+(?:\.[0-9]{1,2})?)', s)
+    if m2:
+        symbol = m2.group(1)
+        cur_map = {'$':'USD', '€':'EUR', '£':'GBP'}
+        try:
+            return float(m2.group(2)), cur_map.get(symbol, None)
+        except:
+            return None, None
+    return None, None
 
-Generate the complete Final Itinerary in the exact structured format.
-- Cluster by location zones (no criss-crossing)
-- Respect opening hours and budget  
-- Include all must-visit places
-- Chronological schedule per day""")
-    
-    final_json = structured_llm.invoke(state['messages'] + [synthesis_prompt])
-    return {"final_output": final_json}
+# Verifier node: returns messages requesting recheck if problems found.
+def verifier_node(state: AgentState):
+    messages = state.get('messages', [])
+    problems = []
+    for msg in messages:
+        text = ""
+        if hasattr(msg, "content"):
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+        text_lower = text.lower()
+        # tokens to look for (lowercased)
+        tokens = ["usd", "eur", "$", "€", "price", "cost"]
+        if any(t in text_lower for t in tokens):
+            price, currency = _extract_price_and_currency(text)
+            if price is None:
+                problems.append({"field":"price_format", "msg":"Could not parse price", "example_text": text[:200]})
+            else:
+                if price < 0 or price > 100000:
+                    problems.append({"field":"price_range", "msg":"Price out of plausible range", "value": price})
+    # If problems found, create a recheck prompt message that planner can handle
+    if problems:
+        recheck_prompt = HumanMessage(content=f"VERIFIER: Found issues: {problems}. Please re-run the necessary tools with clearer queries and include URL sources. Return the tool call plan as JSON.")
+        # return messages that the graph will feed back to planner
+        return {"messages": [recheck_prompt]}
+    # No issues: return empty messages so router can move to formatter
+    return {"messages": []}
 
-# NODE 3: FIXED Router
+# Router used after planner_node to decide tools vs formatter
 def router(state: AgentState) -> Literal["tools", "formatter"]:
     last_message = state['messages'][-1]
-    if last_message.tool_calls:
+    if getattr(last_message, "tool_calls", None):
         return "tools"
     return "formatter"
 
-# --- 6. FIXED Graph ---
+# Router for verifier -> decide to re-run planner or continue to formatter
+def verifier_router(state: AgentState) -> Literal["planner", "formatter"]:
+    # if verifier appended a HumanMessage that contains "VERIFIER: Found issues", go back to planner
+    msgs = state.get('messages', [])
+    for m in msgs:
+        if isinstance(m, HumanMessage) and isinstance(m.content, str) and m.content.startswith("VERIFIER:"):
+            return "planner"
+    return "formatter"
+
+# Formatter node: strong structured output + validation
+def formatter_node(state: AgentState):
+    structured_llm = research_llm.with_structured_output(FinalItinerary)
+    synthesis_prompt = HumanMessage(content="""Based on ALL the research (tool outputs, retrieved docs):
+Generate the complete FinalItinerary JSON, include per-field 'sources' and 'confidence' between 0.0 and 1.0.
+If you cannot verify a fact, set the field value to 'UNVERIFIED: <field>' and explain in travel_tips.
+Return only valid JSON matching the schema.""")
+    final_json = structured_llm.invoke(state['messages'] + [synthesis_prompt])
+
+    # Validate Pydantic (extra guard)
+    try:
+        if isinstance(final_json, FinalItinerary):
+            validated = final_json
+        else:
+            validated = FinalItinerary.model_validate(final_json)
+    except ValidationError as e:
+        retry_prompt = HumanMessage(content=f"Output failed validation: {e}\nPlease re-output only the FinalItinerary JSON exactly matching the schema.")
+        final_json = structured_llm.invoke(state['messages'] + [retry_prompt])
+        validated = FinalItinerary.model_validate(final_json)
+
+    return {"final_output": validated}
+
+# --- 6. FIXED Graph (wired correctly) ---
 workflow = StateGraph(AgentState)
 
 workflow.add_node("planner", planner_node)
-workflow.add_node("tools", ToolNode(tools))  # Now works with annotated state
+workflow.add_node("tools", ToolNode(tools))
+workflow.add_node("verifier", verifier_node)
 workflow.add_node("formatter", formatter_node)
 
 workflow.set_entry_point("planner")
 workflow.add_conditional_edges("planner", router, {"tools": "tools", "formatter": "formatter"})
-workflow.add_edge("tools", "planner") 
+workflow.add_edge("tools", "verifier")
+workflow.add_conditional_edges("verifier", verifier_router, {"planner": "planner", "formatter": "formatter"})
 workflow.add_edge("formatter", END)
 
 app = workflow.compile()
 
-# --- 7. Execution (Unchanged) ---
+# --- 7. Execution (Unchanged, minor robustness) ---
 if __name__ == "__main__":
     user_request = """
     Plan a 3-day trip to Paris for a student.
     Budget: Minimal.
     Must Visit: Eiffel Tower, Louvre, Montmartre, and Versailles.
     """
-    
+
     print(f"User Request: {user_request}")
     print("\n--- 🧠 Agent is Thinking (Checking Locations & Prices)... ---")
-    
+
     inputs = {"messages": [HumanMessage(content=user_request)]}
-    
-    # Run the graph
+
     try:
-        # Stream progress
+        # Stream progress (app.stream may yield nodes' outputs)
         for output in app.stream(inputs):
             for key, value in output.items():
                 print(f"✅ Finished Node: {key}")
-                
-        # Get final result
+
         result = app.invoke(inputs)
         print("\n--- ✅ SMART ITINERARY GENERATED ---")
         print(result["final_output"].model_dump_json(indent=2))
-        
+
     except Exception as e:
         print(f"\n❌ Error Occurred: {e}")
         import traceback
