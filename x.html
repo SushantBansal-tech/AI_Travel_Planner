@@ -1,0 +1,266 @@
+<svg viewBox="0 0 1400 1600" xmlns="http://www.w3.org/2000/svg">
+  <!-- Define styles -->
+  <defs>
+    <style>
+      .layer-box { fill: #f0f4f8; stroke: #2c5282; stroke-width: 2; }
+      .security-box { fill: #fef5e7; stroke: #d68910; stroke-width: 2; }
+      .service-box { fill: #e8f5e9; stroke: #2e7d32; stroke-width: 2; }
+      .db-box { fill: #e3f2fd; stroke: #1565c0; stroke-width: 2; }
+      .integration-box { fill: #fce4ec; stroke: #c2185b; stroke-width: 2; }
+      .title-text { font-family: Arial, sans-serif; font-size: 16px; font-weight: bold; fill: #1a202c; }
+      .subtitle-text { font-family: Arial, sans-serif; font-size: 12px; fill: #4a5568; }
+      .small-text { font-family: Arial, sans-serif; font-size: 10px; fill: #718096; }
+      .layer-title { font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #2d3748; }
+      .arrow { stroke: #4a5568; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .security-arrow { stroke: #d68910; stroke-width: 2; fill: none; marker-end: url(#security-arrowhead); }
+    </style>
+    
+    <!-- Arrow markers -->
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#4a5568" />
+    </marker>
+    <marker id="security-arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <polygon points="0 0, 10 3, 0 6" fill="#d68910" />
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1400" height="1600" fill="#ffffff"/>
+  
+  <!-- Title -->
+  <text x="700" y="30" text-anchor="middle" class="layer-title" font-size="24">AI Travel Planner - High-Level Architecture</text>
+  
+  <!-- CLIENT LAYER -->
+  <rect x="50" y="60" width="1300" height="140" class="layer-box" rx="5"/>
+  <text x="700" y="85" text-anchor="middle" class="layer-title">CLIENT LAYER</text>
+  
+  <rect x="150" y="100" width="150" height="80" class="service-box" rx="3"/>
+  <text x="225" y="135" text-anchor="middle" class="title-text">Web App</text>
+  <text x="225" y="155" text-anchor="middle" class="small-text">React/Vue/Next.js</text>
+  <text x="225" y="170" text-anchor="middle" class="small-text">Progressive Web App</text>
+  
+  <rect x="450" y="100" width="150" height="80" class="service-box" rx="3"/>
+  <text x="525" y="135" text-anchor="middle" class="title-text">Mobile App</text>
+  <text x="525" y="155" text-anchor="middle" class="small-text">iOS & Android</text>
+  <text x="525" y="170" text-anchor="middle" class="small-text">React Native/Flutter</text>
+  
+  <rect x="750" y="100" width="150" height="80" class="service-box" rx="3"/>
+  <text x="825" y="135" text-anchor="middle" class="title-text">Desktop App</text>
+  <text x="825" y="155" text-anchor="middle" class="small-text">Electron/Tauri</text>
+  
+  <rect x="1100" y="100" width="150" height="80" class="service-box" rx="3"/>
+  <text x="1175" y="125" text-anchor="middle" class="title-text">CDN</text>
+  <text x="1175" y="145" text-anchor="middle" class="small-text">CloudFlare</text>
+  <text x="1175" y="160" text-anchor="middle" class="small-text">DDoS Protection</text>
+  <text x="1175" y="175" text-anchor="middle" class="small-text">SSL/TLS</text>
+  
+  <!-- Arrows from clients to security layer -->
+  <path d="M 225 180 L 225 230" class="arrow"/>
+  <path d="M 525 180 L 525 230" class="arrow"/>
+  <path d="M 825 180 L 825 230" class="arrow"/>
+
+  <!-- SECURITY LAYER -->
+  <rect x="50" y="220" width="1300" height="280" class="security-box" rx="5"/>
+  <text x="700" y="245" text-anchor="middle" class="layer-title">🔒 SECURITY LAYER</text>
+  
+  <!-- API Gateway -->
+  <rect x="300" y="260" width="800" height="50" class="security-box" rx="3" stroke-width="3"/>
+  <text x="700" y="280" text-anchor="middle" class="title-text">API Gateway</text>
+  <text x="700" y="298" text-anchor="middle" class="small-text">Rate Limiting • Request Validation • CORS • SSL Termination</text>
+  
+  <!-- WAF -->
+  <rect x="200" y="330" width="350" height="70" class="security-box" rx="3"/>
+  <text x="375" y="355" text-anchor="middle" class="title-text">Web Application Firewall</text>
+  <text x="375" y="372" text-anchor="middle" class="small-text">SQL Injection Protection</text>
+  <text x="375" y="387" text-anchor="middle" class="small-text">XSS & CSRF Protection</text>
+  
+  <!-- Auth Service -->
+  <rect x="600" y="330" width="350" height="70" class="security-box" rx="3"/>
+  <text x="775" y="350" text-anchor="middle" class="title-text">Authentication Service</text>
+  <text x="775" y="367" text-anchor="middle" class="small-text">JWT • OAuth 2.0 • MFA</text>
+  <text x="775" y="382" text-anchor="middle" class="small-text">Session Management</text>
+  <text x="775" y="395" text-anchor="middle" class="small-text">RBAC Authorization</text>
+  
+  <!-- Encryption Layer -->
+  <rect x="200" y="420" width="750" height="60" class="security-box" rx="3"/>
+  <text x="575" y="443" text-anchor="middle" class="title-text">Encryption Layer</text>
+  <text x="575" y="460" text-anchor="middle" class="small-text">AES-256 Encryption • TLS 1.3 • Key Management (KMS) • PII Tokenization</text>
+  <text x="575" y="473" text-anchor="middle" class="small-text">Data Masking • Secure Communication</text>
+  
+  <!-- Arrow to Application Layer -->
+  <path d="M 700 500 L 700 530" class="security-arrow"/>
+
+  <!-- APPLICATION LAYER -->
+  <rect x="50" y="520" width="1300" height="400" class="layer-box" rx="5"/>
+  <text x="700" y="545" text-anchor="middle" class="layer-title">APPLICATION LAYER (Microservices)</text>
+  
+  <!-- Load Balancer -->
+  <rect x="400" y="560" width="600" height="40" class="service-box" rx="3"/>
+  <text x="700" y="585" text-anchor="middle" class="title-text">Load Balancer (Auto-Scaling)</text>
+  
+  <!-- Core Services Row 1 -->
+  <rect x="100" y="620" width="180" height="90" class="service-box" rx="3"/>
+  <text x="190" y="645" text-anchor="middle" class="title-text">Itinerary Service</text>
+  <text x="190" y="662" text-anchor="middle" class="small-text">• AI Planning</text>
+  <text x="190" y="677" text-anchor="middle" class="small-text">• Price Calculation</text>
+  <text x="190" y="692" text-anchor="middle" class="small-text">• Route Optimization</text>
+  
+  <rect x="310" y="620" width="180" height="90" class="service-box" rx="3"/>
+  <text x="400" y="645" text-anchor="middle" class="title-text">Booking Service</text>
+  <text x="400" y="662" text-anchor="middle" class="small-text">• Orchestration</text>
+  <text x="400" y="677" text-anchor="middle" class="small-text">• Saga Pattern</text>
+  <text x="400" y="692" text-anchor="middle" class="small-text">• Rollback Logic</text>
+  
+  <rect x="520" y="620" width="180" height="90" class="service-box" rx="3"/>
+  <text x="610" y="645" text-anchor="middle" class="title-text">Payment Service</text>
+  <text x="610" y="662" text-anchor="middle" class="small-text">• PCI-DSS Compliant</text>
+  <text x="610" y="677" text-anchor="middle" class="small-text">• Fraud Detection</text>
+  <text x="610" y="692" text-anchor="middle" class="small-text">• 3D Secure</text>
+  
+  <rect x="730" y="620" width="180" height="90" class="service-box" rx="3"/>
+  <text x="820" y="645" text-anchor="middle" class="title-text">User Service</text>
+  <text x="820" y="662" text-anchor="middle" class="small-text">• Profile Management</text>
+  <text x="820" y="677" text-anchor="middle" class="small-text">• Preferences</text>
+  <text x="820" y="692" text-anchor="middle" class="small-text">• History</text>
+  
+  <rect x="940" y="620" width="180" height="90" class="service-box" rx="3"/>
+  <text x="1030" y="645" text-anchor="middle" class="title-text">Notification Service</text>
+  <text x="1030" y="662" text-anchor="middle" class="small-text">• Email/SMS</text>
+  <text x="1030" y="677" text-anchor="middle" class="small-text">• Push Notifications</text>
+  <text x="1030" y="692" text-anchor="middle" class="small-text">• Alerts</text>
+  
+  <!-- AI Orchestration -->
+  <rect x="100" y="730" width="480" height="80" class="service-box" rx="3" stroke="#9c27b0" stroke-width="3"/>
+  <text x="340" y="755" text-anchor="middle" class="title-text">🤖 AI Orchestration Service</text>
+  <text x="340" y="772" text-anchor="middle" class="small-text">Claude API Integration • Prompt Engineering</text>
+  <text x="340" y="787" text-anchor="middle" class="small-text">Context Management • NLP Processing</text>
+  <text x="340" y="802" text-anchor="middle" class="small-text">Itinerary Generation • Smart Recommendations</text>
+  
+  <!-- Price Aggregation -->
+  <rect x="620" y="730" width="500" height="80" class="service-box" rx="3"/>
+  <text x="870" y="755" text-anchor="middle" class="title-text">Price Aggregation Service</text>
+  <text x="870" y="772" text-anchor="middle" class="small-text">Real-time Price Fetching • Comparison Engine</text>
+  <text x="870" y="787" text-anchor="middle" class="small-text">Budget Optimization • Deal Discovery</text>
+  <text x="870" y="802" text-anchor="middle" class="small-text">Currency Conversion • Tax Calculation</text>
+  
+  <!-- Booking Orchestration Engine -->
+  <rect x="100" y="830" width="1020" height="70" class="service-box" rx="3" stroke="#e91e63" stroke-width="3"/>
+  <text x="610" y="853" text-anchor="middle" class="title-text">Booking Orchestration Engine (Saga Pattern)</text>
+  <text x="610" y="870" text-anchor="middle" class="small-text">Flight Booking • Hotel Booking • Cab Booking • Attraction Tickets</text>
+  <text x="610" y="885" text-anchor="middle" class="small-text">Transaction Management • Rollback Mechanism • Idempotency • Circuit Breakers</text>
+  
+  <!-- Arrow to Integration Layer -->
+  <path d="M 700 920 L 700 950" class="arrow"/>
+
+  <!-- INTEGRATION LAYER -->
+  <rect x="50" y="940" width="1300" height="220" class="integration-box" rx="5"/>
+  <text x="700" y="965" text-anchor="middle" class="layer-title">INTEGRATION LAYER (External APIs)</text>
+  
+  <!-- API Gateway -->
+  <rect x="300" y="980" width="800" height="40" class="integration-box" rx="3"/>
+  <text x="700" y="1005" text-anchor="middle" class="title-text">API Integration Gateway (Circuit Breaker • Retry • Cache)</text>
+  
+  <!-- External APIs Row 1 -->
+  <rect x="100" y="1040" width="160" height="100" class="integration-box" rx="3"/>
+  <text x="180" y="1065" text-anchor="middle" class="title-text">Flight APIs</text>
+  <text x="180" y="1082" text-anchor="middle" class="small-text">• Amadeus</text>
+  <text x="180" y="1097" text-anchor="middle" class="small-text">• Skyscanner</text>
+  <text x="180" y="1112" text-anchor="middle" class="small-text">• Duffel</text>
+  <text x="180" y="1127" text-anchor="middle" class="small-text">• Kiwi.com</text>
+  
+  <rect x="280" y="1040" width="160" height="100" class="integration-box" rx="3"/>
+  <text x="360" y="1065" text-anchor="middle" class="title-text">Hotel APIs</text>
+  <text x="360" y="1082" text-anchor="middle" class="small-text">• Booking.com</text>
+  <text x="360" y="1097" text-anchor="middle" class="small-text">• Expedia</text>
+  <text x="360" y="1112" text-anchor="middle" class="small-text">• Hotels.com</text>
+  <text x="360" y="1127" text-anchor="middle" class="small-text">• Airbnb</text>
+  
+  <rect x="460" y="1040" width="160" height="100" class="integration-box" rx="3"/>
+  <text x="540" y="1065" text-anchor="middle" class="title-text">Transport APIs</text>
+  <text x="540" y="1082" text-anchor="middle" class="small-text">• Uber API</text>
+  <text x="540" y="1097" text-anchor="middle" class="small-text">• Lyft API</text>
+  <text x="540" y="1112" text-anchor="middle" class="small-text">• Car Rentals</text>
+  <text x="540" y="1127" text-anchor="middle" class="small-text">• Local Cabs</text>
+  
+  <rect x="640" y="1040" width="160" height="100" class="integration-box" rx="3"/>
+  <text x="720" y="1065" text-anchor="middle" class="title-text">Attraction APIs</text>
+  <text x="720" y="1082" text-anchor="middle" class="small-text">• GetYourGuide</text>
+  <text x="720" y="1097" text-anchor="middle" class="small-text">• Viator</text>
+  <text x="720" y="1112" text-anchor="middle" class="small-text">• TripAdvisor</text>
+  <text x="720" y="1127" text-anchor="middle" class="small-text">• Direct APIs</text>
+  
+  <rect x="820" y="1040" width="160" height="100" class="integration-box" rx="3"/>
+  <text x="900" y="1065" text-anchor="middle" class="title-text">Payment APIs</text>
+  <text x="900" y="1082" text-anchor="middle" class="small-text">• Stripe</text>
+  <text x="900" y="1097" text-anchor="middle" class="small-text">• PayPal</text>
+  <text x="900" y="1112" text-anchor="middle" class="small-text">• Razorpay</text>
+  <text x="900" y="1127" text-anchor="middle" class="small-text">• Apple Pay</text>
+  
+  <rect x="1000" y="1040" width="160" height="100" class="integration-box" rx="3"/>
+  <text x="1080" y="1065" text-anchor="middle" class="title-text">Messaging APIs</text>
+  <text x="1080" y="1082" text-anchor="middle" class="small-text">• SendGrid</text>
+  <text x="1080" y="1097" text-anchor="middle" class="small-text">• Twilio</text>
+  <text x="1080" y="1112" text-anchor="middle" class="small-text">• AWS SES</text>
+  <text x="1080" y="1127" text-anchor="middle" class="small-text">• FCM/APNS</text>
+  
+  <!-- Arrow to Data Layer -->
+  <path d="M 700 1160 L 700 1190" class="arrow"/>
+
+  <!-- DATA LAYER -->
+  <rect x="50" y="1180" width="1300" height="180" class="db-box" rx="5"/>
+  <text x="700" y="1205" text-anchor="middle" class="layer-title">DATA LAYER</text>
+  
+  <!-- Encryption -->
+  <rect x="300" y="1220" width="800" height="35" class="security-box" rx="3"/>
+  <text x="700" y="1242" text-anchor="middle" class="subtitle-text">🔐 Encryption: AES-256 (Rest) • TLS 1.3 (Transit) • KMS Key Management</text>
+  
+  <!-- Databases -->
+  <rect x="120" y="1275" width="230" height="65" class="db-box" rx="3"/>
+  <text x="235" y="1298" text-anchor="middle" class="title-text">Primary Database</text>
+  <text x="235" y="1313" text-anchor="middle" class="small-text">PostgreSQL/MySQL</text>
+  <text x="235" y="1328" text-anchor="middle" class="small-text">Users • Bookings • Payments</text>
+  
+  <rect x="380" y="1275" width="210" height="65" class="db-box" rx="3"/>
+  <text x="485" y="1298" text-anchor="middle" class="title-text">Cache Layer</text>
+  <text x="485" y="1313" text-anchor="middle" class="small-text">Redis/Memcached</text>
+  <text x="485" y="1328" text-anchor="middle" class="small-text">Sessions • Prices • API Cache</text>
+  
+  <rect x="620" y="1275" width="210" height="65" class="db-box" rx="3"/>
+  <text x="725" y="1298" text-anchor="middle" class="title-text">Document Store</text>
+  <text x="725" y="1313" text-anchor="middle" class="small-text">MongoDB</text>
+  <text x="725" y="1328" text-anchor="middle" class="small-text">Itineraries • Logs • Analytics</text>
+  
+  <rect x="860" y="1275" width="230" height="65" class="db-box" rx="3"/>
+  <text x="975" y="1298" text-anchor="middle" class="title-text">Search Engine</text>
+  <text x="975" y="1313" text-anchor="middle" class="small-text">Elasticsearch</text>
+  <text x="975" y="1328" text-anchor="middle" class="small-text">Full-text Search • Analytics</text>
+  
+  <!-- MONITORING LAYER -->
+  <rect x="50" y="1380" width="1300" height="120" class="layer-box" rx="5"/>
+  <text x="700" y="1405" text-anchor="middle" class="layer-title">MONITORING & LOGGING LAYER</text>
+  
+  <rect x="120" y="1425" width="350" height="55" class="service-box" rx="3"/>
+  <text x="295" y="1448" text-anchor="middle" class="title-text">Centralized Logging</text>
+  <text x="295" y="1465" text-anchor="middle" class="small-text">ELK Stack / CloudWatch / Splunk</text>
+  
+  <rect x="520" y="1425" width="350" height="55" class="service-box" rx="3"/>
+  <text x="695" y="1448" text-anchor="middle" class="title-text">Monitoring & Alerting</text>
+  <text x="695" y="1465" text-anchor="middle" class="small-text">Prometheus • Grafana • Datadog</text>
+  
+  <rect x="920" y="1425" width="350" height="55" class="service-box" rx="3"/>
+  <text x="1095" y="1448" text-anchor="middle" class="title-text">Security Monitoring</text>
+  <text x="1095" y="1465" text-anchor="middle" class="small-text">SIEM • Audit Logs • Threat Detection</text>
+  
+  <!-- INFRASTRUCTURE LAYER -->
+  <rect x="50" y="1520" width="1300" height="70" class="layer-box" rx="5"/>
+  <text x="700" y="1545" text-anchor="middle" class="layer-title">INFRASTRUCTURE LAYER</text>
+  <text x="700" y="1568" text-anchor="middle" class="subtitle-text">☁️ Cloud: AWS/Azure/GCP • Kubernetes (Auto-scaling) • Docker Containers</text>
+  <text x="700" y="1583" text-anchor="middle" class="subtitle-text">Message Queue (Kafka/RabbitMQ) • Backup & DR • Multi-Region Deployment</text>
+  
+  <!-- Security Badges -->
+  <rect x="1150" y="1520" width="200" height="70" class="security-box" rx="5" stroke-width="3"/>
+  <text x="1250" y="1545" text-anchor="middle" class="title-text">🛡️ Compliance</text>
+  <text x="1250" y="1562" text-anchor="middle" class="small-text">PCI-DSS Level 1</text>
+  <text x="1250" y="1577" text-anchor="middle" class="small-text">GDPR • CCPA • SOC 2</text>
+  
+</svg>

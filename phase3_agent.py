@@ -11,6 +11,12 @@ from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 import re
+import uuid
+
+# Booking demo imports (requires the files you added: booking_schemas.py, booking_tools.py, txn_manager.py)
+from booking_schemas import BookingItem, BookingRequest
+from booking_tools import MockFlightProvider, MockHotelProvider, MockCabProvider
+from txn_manager import TransactionManager
 
 # --- 1. Load Environment ---
 load_dotenv()
@@ -62,7 +68,27 @@ class FinalItinerary(BaseModel):
 # --- 4. The Brain / LLMs ---
 SYSTEM_PROMPT_TEXT = """
 You are "Voyage", a professional AI travel planner. Follow these rules exactly:
-... (kept same as your original SYSTEM_PROMPT_TEXT) ...
+
+1) Format:
+   - At the top include a 1-line TL;DR summary (<= 20 words).
+   - After that provide a structured JSON object that conforms exactly to the FinalItinerary schema (fields: destination, logistics, daily_itinerary, travel_tips). Each Activity must include a "sources" list and a "confidence" score (0.0-1.0).
+   - If you cannot verify a fact (price, opening hour, address), say exactly: "UNVERIFIED: <field> — I couldn't verify this." Do not invent values.
+
+2) Factuality:
+   - Use tool outputs and retrieved documents only. Do not hallucinate. Every factual claim must cite at least one source; prefer 2+ corroborating sources when available.
+   - For price/currency, use numeric values with currency codes (e.g., "120.00 USD").
+   - For dates/times use ISO-like format e.g., "2026-02-14" or "09:00".
+
+3) Behavior:
+   - If the user request lacks a required slot (dates, travelers, budget), ask exactly one short clarifying question.
+   - Keep the assistant concise and point-to-point. No long marketing copy.
+   - For creative suggestions (ideas for romantic activities), use creative LLM instance.
+
+4) Output hygiene:
+   - Provide "sources" as absolute URLs (or tool identifiers) and a "confidence" float.
+   - Include a "provenance" top-level list in the FinalItinerary summarizing the key sources used.
+
+Failure to follow the rules means reject and ask to re-run verification.
 """
 
 research_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, system_instruction=SYSTEM_PROMPT_TEXT)
@@ -166,6 +192,107 @@ Return only valid JSON matching the schema.""")
 
     return {"final_output": validated}
 
+# ---- Mock booking flow integration (demo helper) ----
+def run_mock_booking_for_itinerary(final_itinerary: FinalItinerary, user_id: str = "user_demo"):
+    """
+    Build a simple BookingRequest from FinalItinerary and run the mocked booking flow.
+    final_itinerary: the FinalItinerary Pydantic object returned by your formatter_node
+    This function is ONLY for demo/testing and should be replaced with a proper booking
+    builder that maps itinerary details to concrete providers/options.
+    """
+    # For demo, create one flight + one hotel + one cab item using simple approximations.
+    items = []
+
+    # Flight (parse numeric price if possible)
+    flight_price = 0.0
+    try:
+        flight_text = final_itinerary.logistics.flight_details
+        m = re.search(r'([0-9]+(?:\.[0-9]{1,2})?)', str(flight_text))
+        if m:
+            flight_price = float(m.group(1))
+    except Exception:
+        flight_text = "UNVERIFIED flight info"
+
+    items.append(BookingItem(
+        item_id="flight-" + str(uuid.uuid4())[:8],
+        item_type="flight",
+        description=str(flight_text),
+        provider="mock_flight",
+        price=flight_price or 420.0,
+        currency="USD",
+        taxes=30.0,
+        total=(flight_price or 420.0) + 30.0
+    ))
+
+    # Hotel (parse numeric price if possible)
+    hotel_price = 0.0
+    try:
+        hotel_text = final_itinerary.logistics.hotel_details
+        m2 = re.search(r'([0-9]+(?:\.[0-9]{1,2})?)', str(hotel_text))
+        if m2:
+            hotel_price = float(m2.group(1))
+    except Exception:
+        hotel_text = "UNVERIFIED hotel info"
+
+    items.append(BookingItem(
+        item_id="hotel-" + str(uuid.uuid4())[:8],
+        item_type="hotel",
+        description=str(hotel_text),
+        provider="mock_hotel",
+        price=hotel_price or 60.0,
+        currency="USD",
+        taxes=10.0,
+        total=(hotel_price or 60.0) + 10.0
+    ))
+
+    # Cab (estimate)
+    items.append(BookingItem(
+        item_id="cab-" + str(uuid.uuid4())[:8],
+        item_type="cab",
+        description="Airport pickup / local transfers (estimate)",
+        provider="mock_cab",
+        price=35.0,
+        currency="USD",
+        taxes=0.0,
+        total=35.0
+    ))
+
+    booking_req = BookingRequest(
+        user_id=user_id,
+        itinerary_id=getattr(final_itinerary, "destination", "itn_demo"),
+        items=items,
+        total_amount=sum(i.total for i in items),
+        currency="USD",
+        idempotency_key=str(uuid.uuid4())
+    )
+
+    # Wire mock providers
+    providers = {
+        "flight": MockFlightProvider(),
+        "hotel": MockHotelProvider(),
+        "cab": MockCabProvider(),
+    }
+
+    tm = TransactionManager(booking_req, providers)
+
+    print("\n--- Starting mocked booking flow (reserve) ---")
+    booking_after_reserve = tm.reserve_all()
+    for it in booking_after_reserve.items:
+        print(f"RESERVE: {it.item_id}: status={it.status}, hold_id={it.hold_id}, meta={it.meta}")
+
+    # Simulate payment authorization (in real app, use hosted checkout and webhooks)
+    payment_auth = {"type": "mock", "id": "paytok_demo"}
+
+    print("\n--- Confirming bookings (mock) ---")
+    booking_after_confirm = tm.confirm_all(payment_auth)
+    print("\n--- Booking result ---")
+    print("booking_request.status:", booking_after_confirm.status)
+    for it in booking_after_confirm.items:
+        print(f"FINAL: {it.item_id}: status={it.status}, confirmed_id={it.confirmed_id}, meta={it.meta}")
+
+    return booking_after_confirm
+# ---- end mock booking helper ----
+
 # --- 6. FIXED Graph (wired correctly) ---
 workflow = StateGraph(AgentState)
 
@@ -203,7 +330,13 @@ if __name__ == "__main__":
 
         result = app.invoke(inputs)
         print("\n--- ✅ SMART ITINERARY GENERATED ---")
-        print(result["final_output"].model_dump_json(indent=2))
+        # result["final_output"] should be a FinalItinerary Pydantic model (formatter_node ensures validation)
+        final_itinerary = result.get("final_output")
+        print(final_itinerary.model_dump_json(indent=2))
+
+        # DEMO: run mocked booking flow based on the generated itinerary
+        # (This is for testing/demo only. Replace with real booking adapters and payment flow later.)
+        run_mock_booking_for_itinerary(final_itinerary, user_id="user_demo")
 
     except Exception as e:
         print(f"\n❌ Error Occurred: {e}")

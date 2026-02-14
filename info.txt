@@ -1,0 +1,35 @@
+Flights: Amadeus for Developers, Skyscanner Flights API, Kiwi, or Sabre (depends on region and budget). Amadeus has a good sandbox.
+
+Hotels: Booking.com Partner API, Expedia Rapid API, Hotelbeds (B2B), or Priceline. Many require applications and contracts.
+
+Attractions & Tours: Viator API, GetYourGuide, Eventbrite.
+
+Cabs / Local transport: Uber, Lyft (regional), or local aggregator APIs. For simpler MVP, use ride-hailing booking links rather than full integration.
+
+Search / Live info: SerpAPI (you already use), Google Places API for POIs, opening hours, addresses.
+
+Payments: Stripe (Checkout + PaymentIntent), Adyen, PayPal (hosted flow).
+
+Maps / Routing: Google Maps Directions or Mapbox for distances and cab ETA/cost estimates.
+
+
+
+What to Build:
+├─ Frontend (React/Next.js) - Shows UI/UX skills
+├─ Backend API (Node.js/Python) - Shows backend skills
+├─ AI Integration (Claude API) - Shows AI implementation
+├─ Mock Booking System - Simulates real bookings
+├─ Database (PostgreSQL) - Shows data modeling
+├─ Authentication - Shows security knowledge
+└─ Deployment (AWS/Vercel) - Shows DevOps skills
+
+Real Integrations (Free/Cheap):
+✅ Claude API for AI planning
+✅ Stripe Sandbox for payments (free)
+✅ SendGrid for emails (free tier)
+✅ Google Maps API (free tier)
+
+Mock/Simulate:
+🎭 Flight bookings (show UI, fake the booking)
+🎭 Hotel bookings (use dummy data)
+🎭 Cab bookings (simulate the flow)
