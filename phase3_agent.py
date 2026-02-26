@@ -1,344 +1,686 @@
 import os
-from dotenv import load_dotenv
-from typing import Annotated, List, Literal, TypedDict, Any
+import math
+import json
 import operator
+from typing import Annotated, List, Literal, TypedDict, Any, Dict
+from datetime import date
+
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.utilities import SerpAPIWrapper
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage, ToolMessage
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-import re
-import uuid
 
-# Booking demo imports (requires the files you added: booking_schemas.py, booking_tools.py, txn_manager.py)
-from booking_schemas import BookingItem, BookingRequest
-from booking_tools import MockFlightProvider, MockHotelProvider, MockCabProvider
-from txn_manager import TransactionManager
+from amadeus import Client as AmadeusClient, ResponseError
 
-# --- 1. Load Environment ---
 load_dotenv()
 
-# --- 2. Tools ---
+# ─────────────────────────────────────────────
+# 1. Clients
+# ─────────────────────────────────────────────
+amadeus = AmadeusClient(
+    client_id=os.getenv("AMADEUS_CLIENT_ID"),
+    client_secret=os.getenv("AMADEUS_CLIENT_SECRET"),
+)
 search = SerpAPIWrapper()
 
+
+# ─────────────────────────────────────────────
+# 2. Haversine helper
+# ─────────────────────────────────────────────
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ─────────────────────────────────────────────
+# 3. Tools
+# ─────────────────────────────────────────────
+
 @tool
-def google_search(query: str):
+def google_search(query: str) -> str:
     """
-    Use this tool to find:
-    1. Flight & Hotel prices.
-    2. OPENING HOURS of attractions.
-    3. LOCATIONS (e.g. 'Is Senso-ji near Tokyo Skytree?').
+    Search the web for:
+    1. Top tourist attractions / places to visit at a destination.
+    2. Opening hours, entry prices of specific attractions.
+    3. Neighborhood / area context for a place.
+    Always include the city name in the query.
     """
     return search.run(query)
 
-tools = [google_search]
 
-# --- 3. Schema (with provenance & confidence) ---
+@tool
+def amadeus_flight_search(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str = "",
+    adults: int = 1,
+    cabin_class: str = "ECONOMY",
+) -> str:
+    """
+    Search for available flights using the Amadeus Flight Offers Search API.
+
+    Args:
+        origin:         IATA airport code of the departure city (e.g. 'DEL').
+        destination:    IATA airport code of the arrival city (e.g. 'CDG').
+        departure_date: Departure date in YYYY-MM-DD format.
+        return_date:    Return date in YYYY-MM-DD format (leave empty for one-way).
+        adults:         Number of adult passengers.
+        cabin_class:    One of ECONOMY | PREMIUM_ECONOMY | BUSINESS | FIRST.
+
+    Returns a JSON string containing flight offers with total_found count.
+    """
+    print(f"[FLIGHT TOOL] Searching: {origin} -> {destination} on {departure_date}")
+
+    try:
+        kwargs = dict(
+            originLocationCode=origin,
+            destinationLocationCode=destination,
+            departureDate=departure_date,
+            adults=adults,
+            max=10,
+            currencyCode="USD",
+            travelClass=cabin_class,
+        )
+        if return_date:
+            kwargs["returnDate"] = return_date
+
+        offers = amadeus.shopping.flight_offers_search.get(**kwargs).data
+
+        if not offers:
+            return json.dumps({"error": "No flight offers found.", "total_found": 0})
+
+        print(f"[FLIGHT TOOL] Found {len(offers)} flights")
+        return json.dumps({"flights": offers, "total_found": len(offers)}, indent=2)
+
+    except ResponseError as e:
+        error_body = str(e)
+        if "410" in error_body:
+            return json.dumps({
+                "error": "410 - No flight data in Amadeus TEST env for this route. Switch to production keys.",
+                "total_found": 0
+            })
+        return json.dumps({"error": error_body, "total_found": 0})
+
+
+@tool
+def amadeus_hotels_near_places(
+    places_with_coords: str,
+    check_in_date: str,
+    check_out_date: str,
+    adults: int = 1,
+    radius_km: int = 10,
+) -> str:
+    """
+    Find the cheapest hotels closest to a set of visiting places using Amadeus.
+
+    Args:
+        places_with_coords: JSON string — list of dicts with keys: name, lat, lng.
+                            Example:
+                            '[{"name":"Eiffel Tower","lat":48.8584,"lng":2.2945},
+                              {"name":"Louvre","lat":48.8606,"lng":2.3376}]'
+                            Build this from google_search results using your knowledge
+                            of the coordinates of the places.
+        check_in_date:  YYYY-MM-DD
+        check_out_date: YYYY-MM-DD
+        adults:         Number of guests.
+        radius_km:      Search radius around centroid in km (default 10).
+
+    Returns a JSON string with total_hotels_found and recommended budget/mid-range hotels.
+    """
+    print(f"[HOTEL TOOL] check_in={check_in_date}, check_out={check_out_date}")
+    print(f"[HOTEL TOOL] places={places_with_coords[:200]}")
+
+    try:
+        places = json.loads(places_with_coords)
+        if not places:
+            return json.dumps({"error": "No places provided."})
+
+        # Step A: Compute centroid of all visiting places
+        centroid_lat = sum(p["lat"] for p in places) / len(places)
+        centroid_lng = sum(p["lng"] for p in places) / len(places)
+        print(f"[HOTEL TOOL] Centroid: {centroid_lat:.4f}, {centroid_lng:.4f}")
+
+        # Step B: Get hotel IDs near centroid
+        hotel_list_resp = amadeus.reference_data.locations.hotels.by_geocode.get(
+            latitude=centroid_lat,
+            longitude=centroid_lng,
+            radius=radius_km,
+            radiusUnit="KM",
+            hotelSource="ALL",
+        ).data
+
+        if not hotel_list_resp:
+            return json.dumps({
+                "error": f"No hotels found within {radius_km} km of centroid.",
+                "centroid": {"lat": centroid_lat, "lng": centroid_lng},
+                "total_hotels_found": 0,
+            })
+
+        hotel_ids = [h["hotelId"] for h in hotel_list_resp[:20]]
+        print(f"[HOTEL TOOL] Found {len(hotel_ids)} hotel IDs: {hotel_ids}")
+
+        # Step C: Try live offers first
+        offers_resp = None
+        try:
+            offers_resp = amadeus.shopping.hotel_offers_search.get(
+                hotelIds=hotel_ids,
+                adults=adults,
+                checkInDate=check_in_date,
+                checkOutDate=check_out_date,
+                currencyCode="USD",
+                bestRateOnly=True,
+            ).data
+        except ResponseError as offer_err:
+            print(f"[HOTEL TOOL] Offers search failed: {offer_err}")
+
+        # ── FALLBACK: offers unavailable (test env) → use by_hotels for names ──
+        if not offers_resp:
+            print("[HOTEL TOOL] Offers returned None. Falling back to by_hotels for names...")
+            fallback_results = []
+
+            for hotel_id in hotel_ids[:10]:
+                try:
+                    detail = amadeus.reference_data.locations.hotels.by_hotels.get(
+                        hotelIds=[hotel_id]
+                    ).data
+
+                    if detail:
+                        h = detail[0]
+                        h_lat = h.get("geoCode", {}).get("latitude")
+                        h_lng = h.get("geoCode", {}).get("longitude")
+
+                        dist_centroid = (
+                            haversine_km(h_lat, h_lng, centroid_lat, centroid_lng)
+                            if h_lat and h_lng else None
+                        )
+
+                        closest = []
+                        if h_lat and h_lng:
+                            dists = [
+                                (haversine_km(h_lat, h_lng, p["lat"], p["lng"]), p["name"])
+                                for p in places
+                            ]
+                            dists.sort()
+                            closest = [f"{name} (~{d:.1f} km)" for d, name in dists[:2]]
+
+                        fallback_results.append({
+                            "hotel_id":                hotel_id,
+                            "name":                    h.get("name", "UNVERIFIED"),
+                            "chain_code":              h.get("chainCode"),
+                            "latitude":                h_lat,
+                            "longitude":               h_lng,
+                            "distance_to_centroid_km": round(dist_centroid, 2) if dist_centroid else "UNVERIFIED",
+                            "closest_activities":      closest,
+                            "offer_id":                "UNVERIFIED: not available in test env",
+                            "check_in":                check_in_date,
+                            "check_out":               check_out_date,
+                            "nights":                  max(1, (date.fromisoformat(check_out_date) - date.fromisoformat(check_in_date)).days),
+                            "room_type":               "UNVERIFIED",
+                            "bed_type":                "UNVERIFIED",
+                            "board_type":              "UNVERIFIED",
+                            "price": {
+                                "currency":      "USD",
+                                "base":          "UNVERIFIED",
+                                "total":         "UNVERIFIED",
+                                "selling_total": "UNVERIFIED",
+                                "per_night":     "UNVERIFIED",
+                            },
+                            "cancellation_policy": "UNVERIFIED",
+                            "payment_type":        "UNVERIFIED",
+                            "why_recommended":     (
+                                f"{h.get('name','Hotel')} is ~{dist_centroid:.1f} km from activity centroid"
+                                + (f", closest to: {', '.join(closest)}" if closest else "")
+                                if dist_centroid else "UNVERIFIED: distance not available"
+                            ),
+                            "sources":    ["amadeus_by_hotels_fallback"],
+                            "confidence": 0.5,
+                        })
+
+                except ResponseError as e:
+                    print(f"[HOTEL TOOL] Skipping {hotel_id}: {e}")
+                    continue
+
+            print(f"[HOTEL TOOL] Fallback returned {len(fallback_results)} hotels.")
+
+            return json.dumps({
+                "source":             "amadeus_by_hotels_fallback (offers unavailable in test env)",
+                "centroid": {
+                    "latitude":  centroid_lat,
+                    "longitude": centroid_lng,
+                    "note":      f"Centroid of {len(places)} visiting places",
+                },
+                "radius_km":          radius_km,
+                "total_hotels_found": len(fallback_results),
+                "recommended": {
+                    "budget":    fallback_results[0] if fallback_results else None,
+                    "mid_range": fallback_results[1] if len(fallback_results) > 1 else None,
+                },
+            }, indent=2)
+
+        # ── HAPPY PATH: offers available ──
+        nights = max(
+            1,
+            (date.fromisoformat(check_out_date) - date.fromisoformat(check_in_date)).days,
+        )
+
+        enriched = []
+        for entry in offers_resp:
+            hotel = entry.get("hotel", {})
+            offer = entry.get("offers", [{}])[0]
+            price_total = float(offer.get("price", {}).get("total", 0) or 0)
+            h_lat = hotel.get("latitude")
+            h_lng = hotel.get("longitude")
+
+            dist_centroid = (
+                haversine_km(h_lat, h_lng, centroid_lat, centroid_lng)
+                if h_lat and h_lng else None
+            )
+
+            closest = []
+            if h_lat and h_lng:
+                dists = [
+                    (haversine_km(h_lat, h_lng, p["lat"], p["lng"]), p["name"])
+                    for p in places
+                ]
+                dists.sort()
+                closest = [f"{name} (~{d:.1f} km)" for d, name in dists[:2]]
+
+            enriched.append({
+                "hotel_id":                hotel.get("hotelId", "UNVERIFIED"),
+                "name":                    hotel.get("name", "UNVERIFIED"),
+                "chain_code":              hotel.get("chainCode"),
+                "latitude":                h_lat,
+                "longitude":               h_lng,
+                "distance_to_centroid_km": round(dist_centroid, 2) if dist_centroid else "UNVERIFIED",
+                "closest_activities":      closest,
+                "offer_id":                offer.get("id", "UNVERIFIED"),
+                "check_in":                offer.get("checkInDate", check_in_date),
+                "check_out":               offer.get("checkOutDate", check_out_date),
+                "nights":                  nights,
+                "room_type":               offer.get("room", {}).get("typeEstimated", {}).get("category", "UNVERIFIED"),
+                "bed_type":                offer.get("room", {}).get("typeEstimated", {}).get("bedType", "UNVERIFIED"),
+                "board_type":              offer.get("boardType", "ROOM_ONLY"),
+                "price": {
+                    "currency":      offer.get("price", {}).get("currency", "USD"),
+                    "base":          offer.get("price", {}).get("base", "UNVERIFIED"),
+                    "total":         str(price_total),
+                    "selling_total": offer.get("price", {}).get("sellingTotal", "UNVERIFIED"),
+                    "per_night":     str(round(price_total / nights, 2)),
+                },
+                "cancellation_policy": (
+                    offer.get("policies", {})
+                    .get("cancellations", [{}])[0]
+                    .get("description", {})
+                    .get("text", "UNVERIFIED")
+                    if offer.get("policies", {}).get("cancellations")
+                    else "UNVERIFIED"
+                ),
+                "payment_type":  offer.get("policies", {}).get("paymentType", "UNVERIFIED"),
+                "why_recommended": (
+                    f"{hotel.get('name','Hotel')} is ~{dist_centroid:.1f} km from activity centroid"
+                    + (f", closest to: {', '.join(closest)}" if closest else "")
+                    if dist_centroid
+                    else "UNVERIFIED: distance not returned by API"
+                ),
+                "sources":    ["amadeus_hotels_by_geocode", "amadeus_hotel_offers_search"],
+                "confidence": 0.95,
+            })
+
+        enriched.sort(key=lambda h: float(h["price"]["total"] or 0))
+        budget_pick   = enriched[0] if enriched else None
+        mid_idx       = len(enriched) // 2
+        midrange_pick = enriched[mid_idx] if len(enriched) > 1 else None
+
+        print(f"[HOTEL TOOL] Returning {len(enriched)} hotels. Budget: {budget_pick['name'] if budget_pick else 'None'}")
+
+        return json.dumps({
+            "source": "amadeus_hotels_by_geocode + amadeus_hotel_offers_search",
+            "centroid": {
+                "latitude":  centroid_lat,
+                "longitude": centroid_lng,
+                "note":      f"Centroid of {len(places)} visiting places",
+            },
+            "radius_km":          radius_km,
+            "total_hotels_found": len(enriched),
+            "recommended": {
+                "budget":    budget_pick,
+                "mid_range": midrange_pick,
+            },
+        }, indent=2)
+
+    except ResponseError as e:
+        return json.dumps({"error": str(e), "total_hotels_found": 0, "source": "amadeus_hotels_by_geocode"})
+    except Exception as e:
+        print(f"[HOTEL TOOL] Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        return json.dumps({"error": f"Unexpected error: {str(e)}", "total_hotels_found": 0})
+
+
+# All 3 tools active now
+tools = [google_search, amadeus_flight_search, amadeus_hotels_near_places]
+
+
+# ─────────────────────────────────────────────
+# 4. Pydantic Schemas
+# ─────────────────────────────────────────────
+
 class Activity(BaseModel):
-    time_slot: str = Field(description="e.g., '09:00 AM - 11:30 AM'")
-    activity_name: str = Field(description="Name of the place or activity")
-    description: str = Field(description="What to do there")
-    location_zone: str = Field(description="Neighborhood name (e.g., 'Shibuya', 'Downtown')")
-    price_estimate: str = Field(description="Cost of ticket/entry if any")
-    sources: List[str] = Field(default_factory=list, description="URLs or tool identifiers used to verify this activity")
-    confidence: float = Field(default=0.0, description="Confidence score 0.0-1.0")
+    time_slot: str
+    activity_name: str
+    description: str
+    location_zone: str
+    latitude: float
+    longitude: float
+    price_estimate: str
+    sources: List[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
 
 class DayPlan(BaseModel):
     day_number: int
-    theme: str = Field(description="Theme of the day")
-    schedule: List[Activity] = Field(description="Chronological list of activities")
+    date: str
+    theme: str
+    geographic_cluster: str
+    schedule: List[Activity]
+
 
 class TripLogistics(BaseModel):
-    flight_details: str = Field(description="Cheapest flight found with price and airline")
-    hotel_details: str = Field(description="Budget hotel found with price and location")
-    total_trip_cost: str = Field(description="Total estimated cost")
+    visa_required: str
+    currency: str
+    local_transport: str
+    estimated_daily_budget_excl_hotel: str
+
+
+class ItineraryCentroid(BaseModel):
+    latitude: float
+    longitude: float
+    note: str
+
+
+class FlightData(BaseModel):
+    flights: List[Dict[str, Any]]
+    total_found: int
+
+
+class HotelPrice(BaseModel):
+    currency: str
+    base: str
+    total: str
+    selling_total: str
+    per_night: str
+
+
+class HotelOption(BaseModel):
+    hotel_id: str
+    name: str
+    chain_code: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    distance_to_centroid_km: Any
+    closest_activities: List[str] = Field(default_factory=list)
+    offer_id: str
+    check_in: str
+    check_out: str
+    nights: int
+    room_type: str
+    bed_type: str
+    board_type: str
+    price: HotelPrice
+    cancellation_policy: str
+    payment_type: str
+    why_recommended: str
     sources: List[str] = Field(default_factory=list)
-    confidence: float = Field(default=0.0)
+    confidence: float = Field(default=0.95)
+
 
 class FinalItinerary(BaseModel):
+    tldr: str = Field(description="One-line summary, max 20 words")
     destination: str
+    trip_purpose: str = Field(description="LEISURE | BUSINESS | UNKNOWN")
+    provenance: List[str] = Field(default_factory=list)
+    itinerary_centroid: ItineraryCentroid
+    flights: FlightData
+    hotels: List[HotelOption] = Field(default_factory=list)
     logistics: TripLogistics
     daily_itinerary: List[DayPlan]
-    provenance: List[str] = Field(default_factory=list, description="Top-level provenance sources")
-    travel_tips: str = Field(description="Tips for saving money")
+    travel_tips: List[str]
 
-# --- 4. The Brain / LLMs ---
+
+# ─────────────────────────────────────────────
+# 5. System Prompt
+# ─────────────────────────────────────────────
 SYSTEM_PROMPT_TEXT = """
-You are "Voyage", a professional AI travel planner. Follow these rules exactly:
+You are "Voyage", a professional AI travel planner. You have three tools:
+  - google_search              — find visiting places, hours, prices
+  - amadeus_flight_search      — get real flights from Amadeus API
+  - amadeus_hotels_near_places — get real hotels near visiting places from Amadeus API
 
-1) Format:
-   - At the top include a 1-line TL;DR summary (<= 20 words).
-   - After that provide a structured JSON object that conforms exactly to the FinalItinerary schema (fields: destination, logistics, daily_itinerary, travel_tips). Each Activity must include a "sources" list and a "confidence" score (0.0-1.0).
-   - If you cannot verify a fact (price, opening hour, address), say exactly: "UNVERIFIED: <field> — I couldn't verify this." Do not invent values.
+REQUIRED SLOTS (ask if any are missing):
+  origin (IATA), destination (IATA), departure_date (YYYY-MM-DD),
+  adults (int), return_date (optional), cabin_class (default ECONOMY)
 
-2) Factuality:
-   - Use tool outputs and retrieved documents only. Do not hallucinate. Every factual claim must cite at least one source; prefer 2+ corroborating sources when available.
-   - For price/currency, use numeric values with currency codes (e.g., "120.00 USD").
-   - For dates/times use ISO-like format e.g., "2026-02-14" or "09:00".
+MANDATORY TOOL CALL SEQUENCE — always in this exact order:
 
-3) Behavior:
-   - If the user request lacks a required slot (dates, travelers, budget), ask exactly one short clarifying question.
-   - Keep the assistant concise and point-to-point. No long marketing copy.
-   - For creative suggestions (ideas for romantic activities), use creative LLM instance.
+STEP 1 — google_search
+  Query: "top places to visit in <destination>"
+  Extract: place names, prices, ratings.
 
-4) Output hygiene:
-   - Provide "sources" as absolute URLs (or tool identifiers) and a "confidence" float.
-   - Include a "provenance" top-level list in the FinalItinerary summarizing the key sources used.
+STEP 2 — amadeus_flight_search
+  Use: origin, destination, departure_date, return_date, adults, cabin_class.
+  Copy ALL fields from tool output into flights section.
 
-Failure to follow the rules means reject and ask to re-run verification.
+STEP 3 — amadeus_hotels_near_places
+  After google_search, build places_with_coords using top 5 places from Step 1.
+  Use YOUR OWN KNOWLEDGE to fill in lat/lng for each place name.
+  Build this exact JSON string format:
+  '[{"name":"Eiffel Tower","lat":48.8584,"lng":2.2945},
+    {"name":"Louvre Museum","lat":48.8606,"lng":2.3376},
+    {"name":"Notre-Dame","lat":48.8530,"lng":2.3499},
+    {"name":"Sacre-Coeur","lat":48.8867,"lng":2.3431},
+    {"name":"Arc de Triomphe","lat":48.8738,"lng":2.2950}]'
+
+  Then call amadeus_hotels_near_places with:
+    places_with_coords = <above JSON string>
+    check_in_date      = departure_date
+    check_out_date     = return_date (or departure_date + 3 days if one-way)
+    adults             = adults
+
+STEP 4 — Build daily_itinerary
+  Use places from Step 1. Group by geographic_cluster per day.
+  Each activity MUST include lat/lng (confidence <= 0.70 for estimated).
+
+OUTPUT RULES:
+- Pure JSON matching FinalItinerary schema exactly.
+- flights: copy ENTIRE amadeus_flight_search output (flights list + total_found).
+- hotels: extract recommended.budget and recommended.mid_range from hotel tool output.
+- itinerary_centroid: copy from amadeus_hotels_near_places centroid field.
+- All flight/hotel data MUST come from Amadeus tool outputs — never invent.
+- If field missing: "UNVERIFIED: <field> not returned by API"
+- Never output partial JSON.
 """
 
-research_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, system_instruction=SYSTEM_PROMPT_TEXT)
-creative_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)  # for creative suggestions
 
+# ─────────────────────────────────────────────
+# 6. LLMs
+# ─────────────────────────────────────────────
+research_llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0,
+)
 llm_with_tools = research_llm.bind_tools(tools)
 
-# --- 5. FIXED State ---
-class AgentState(TypedDict):
-    messages: Annotated[List[AnyMessage], operator.add]  # Proper accumulation
-    final_output: Any  # will set to FinalItinerary instance later
 
-# NODE 1: Planner (unchanged except using research_llm bound tools)
+# ─────────────────────────────────────────────
+# 7. State
+# ─────────────────────────────────────────────
+class AgentState(TypedDict):
+    messages: Annotated[List[AnyMessage], operator.add]
+    final_output: Any
+
+
+# ─────────────────────────────────────────────
+# 8. Nodes
+# ─────────────────────────────────────────────
+
 def planner_node(state: AgentState):
-    response = llm_with_tools.invoke(state['messages'])
+    system_msg = SystemMessage(content=SYSTEM_PROMPT_TEXT)
+    messages = [system_msg] + state["messages"]
+    response = llm_with_tools.invoke(messages)
+    print("[PLANNER] Ran successfully.")
     return {"messages": [response]}
 
-# helper: robust price/currency extraction (case-insensitive)
-def _extract_price_and_currency(s: str):
-    if not s:
-        return None, None
-    # Try explicit ISO currency codes first (case-insensitive)
-    m = re.search(r'([0-9]+(?:\.[0-9]{1,2})?)\s*([A-Z]{3})', s, flags=re.I)
-    if m:
-        try:
-            return float(m.group(1)), m.group(2).upper()
-        except:
-            return None, None
-    # Try common currency symbols
-    m2 = re.search(r'([$€£])\s*([0-9]+(?:\.[0-9]{1,2})?)', s)
-    if m2:
-        symbol = m2.group(1)
-        cur_map = {'$':'USD', '€':'EUR', '£':'GBP'}
-        try:
-            return float(m2.group(2)), cur_map.get(symbol, None)
-        except:
-            return None, None
-    return None, None
 
-# Verifier node: returns messages requesting recheck if problems found.
-def verifier_node(state: AgentState):
-    messages = state.get('messages', [])
-    problems = []
-    for msg in messages:
-        text = ""
-        if hasattr(msg, "content"):
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-        text_lower = text.lower()
-        # tokens to look for (lowercased)
-        tokens = ["usd", "eur", "$", "€", "price", "cost"]
-        if any(t in text_lower for t in tokens):
-            price, currency = _extract_price_and_currency(text)
-            if price is None:
-                problems.append({"field":"price_format", "msg":"Could not parse price", "example_text": text[:200]})
-            else:
-                if price < 0 or price > 100000:
-                    problems.append({"field":"price_range", "msg":"Price out of plausible range", "value": price})
-    # If problems found, create a recheck prompt message that planner can handle
-    if problems:
-        recheck_prompt = HumanMessage(content=f"VERIFIER: Found issues: {problems}. Please re-run the necessary tools with clearer queries and include URL sources. Return the tool call plan as JSON.")
-        # return messages that the graph will feed back to planner
-        return {"messages": [recheck_prompt]}
-    # No issues: return empty messages so router can move to formatter
-    return {"messages": []}
-
-# Router used after planner_node to decide tools vs formatter
 def router(state: AgentState) -> Literal["tools", "formatter"]:
-    last_message = state['messages'][-1]
-    if getattr(last_message, "tool_calls", None):
+    last = state["messages"][-1]
+    if getattr(last, "tool_calls", None):
         return "tools"
     return "formatter"
 
-# Router for verifier -> decide to re-run planner or continue to formatter
+
+def verifier_node(state: AgentState):
+    messages = state.get("messages", [])
+    tool_outputs = [
+        m.content for m in messages
+        if isinstance(m, ToolMessage) and isinstance(m.content, str)
+    ]
+
+    print(f"[VERIFIER] Checking {len(tool_outputs)} tool outputs")
+    problems = []
+
+    flight_done = any("total_found" in t for t in tool_outputs)
+    if not flight_done:
+        problems.append("amadeus_flight_search has not been called yet. Call it now.")
+
+    hotel_done = any("total_hotels_found" in t for t in tool_outputs)
+    if not hotel_done:
+        problems.append(
+            "amadeus_hotels_near_places has not been called yet. "
+            "Take the top 5 places from google_search, add lat/lng from your knowledge, "
+            "build the places_with_coords JSON string, then call amadeus_hotels_near_places."
+        )
+
+    if problems:
+        print(f"[VERIFIER] Issues found: {problems}")
+        recheck = HumanMessage(
+            content="VERIFIER ISSUES:\n" + "\n".join(f"- {p}" for p in problems)
+            + "\nPlease call the missing tools to fix the issues."
+        )
+        return {"messages": [recheck]}
+
+    print("[VERIFIER] All tools called successfully.")
+    return {"messages": []}
+
+
 def verifier_router(state: AgentState) -> Literal["planner", "formatter"]:
-    # if verifier appended a HumanMessage that contains "VERIFIER: Found issues", go back to planner
-    msgs = state.get('messages', [])
-    for m in msgs:
-        if isinstance(m, HumanMessage) and isinstance(m.content, str) and m.content.startswith("VERIFIER:"):
+    msgs = state.get("messages", [])
+    for m in reversed(msgs):
+        if isinstance(m, HumanMessage) and isinstance(m.content, str) and m.content.startswith("VERIFIER"):
+            print("[VERIFIER ROUTER] Issues found, routing back to planner.")
             return "planner"
+    print("[VERIFIER ROUTER] All good, routing to formatter.")
     return "formatter"
 
-# Formatter node: strong structured output + validation
+
 def formatter_node(state: AgentState):
+    print(f"[FORMATTER] Received {len(state['messages'])} messages.")
     structured_llm = research_llm.with_structured_output(FinalItinerary)
-    synthesis_prompt = HumanMessage(content="""Based on ALL the research (tool outputs, retrieved docs):
-Generate the complete FinalItinerary JSON, include per-field 'sources' and 'confidence' between 0.0 and 1.0.
-If you cannot verify a fact, set the field value to 'UNVERIFIED: <field>' and explain in travel_tips.
-Return only valid JSON matching the schema.""")
-    final_json = structured_llm.invoke(state['messages'] + [synthesis_prompt])
 
-    # Validate Pydantic (extra guard)
-    try:
-        if isinstance(final_json, FinalItinerary):
-            validated = final_json
-        else:
-            validated = FinalItinerary.model_validate(final_json)
-    except ValidationError as e:
-        retry_prompt = HumanMessage(content=f"Output failed validation: {e}\nPlease re-output only the FinalItinerary JSON exactly matching the schema.")
-        final_json = structured_llm.invoke(state['messages'] + [retry_prompt])
-        validated = FinalItinerary.model_validate(final_json)
+    synthesis_prompt = HumanMessage(content="""
+Using ALL tool outputs in this conversation, generate the complete FinalItinerary JSON.
 
-    return {"final_output": validated}
+MAPPING RULES:
+- flights:            Copy ENTIRE amadeus_flight_search output (flights list + total_found)
+- hotels:             Extract recommended.budget and recommended.mid_range from
+                      amadeus_hotels_near_places output as a list of 2 HotelOption objects
+- itinerary_centroid: Copy latitude/longitude/note from amadeus_hotels_near_places centroid field
+- daily_itinerary:    Build from google_search results with lat/lng per activity
+- trip_purpose:       Set based on trip context (LEISURE for tourist trips)
 
-# ---- Mock booking flow integration (demo helper) ----
-def run_mock_booking_for_itinerary(final_itinerary: FinalItinerary, user_id: str = "user_demo"):
-    """
-    Build a simple BookingRequest from FinalItinerary and run the mocked booking flow.
-    final_itinerary: the FinalItinerary Pydantic object returned by your formatter_node
-    This function is ONLY for demo/testing and should be replaced with a proper booking
-    builder that maps itinerary details to concrete providers/options.
-    """
-    # For demo, create one flight + one hotel + one cab item using simple approximations.
-    items = []
+If any field is missing from tool output use: "UNVERIFIED: <field> not returned by API"
+Confidence: 0.95 for Amadeus data, 0.70 for LLM-estimated values.
+Return ONLY valid JSON matching FinalItinerary schema exactly.
+""")
 
-    # Flight (parse numeric price if possible)
-    flight_price = 0.0
-    try:
-        flight_text = final_itinerary.logistics.flight_details
-        m = re.search(r'([0-9]+(?:\.[0-9]{1,2})?)', str(flight_text))
-        if m:
-            flight_price = float(m.group(1))
-    except Exception:
-        flight_text = "UNVERIFIED flight info"
+    for attempt in range(2):
+        try:
+            result = structured_llm.invoke(state["messages"] + [synthesis_prompt])
+            validated = FinalItinerary.model_validate(result)
+            print("[FORMATTER] Success.")
+            return {"final_output": validated}
+        except ValidationError as e:
+            print(f"[FORMATTER] Validation error attempt {attempt + 1}: {e}")
+            if attempt == 1:
+                return {"final_output": {"error": "Schema validation failed", "details": str(e)}}
+            synthesis_prompt = HumanMessage(
+                content=f"PREVIOUS JSON FAILED VALIDATION:\n{e}\nFix ALL errors and output valid JSON."
+            )
+        except Exception as e:
+            print(f"[FORMATTER] Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"final_output": {"error": str(e)}}
 
-    items.append(BookingItem(
-        item_id="flight-" + str(uuid.uuid4())[:8],
-        item_type="flight",
-        description=str(flight_text),
-        provider="mock_flight",
-        price=flight_price or 420.0,
-        currency="USD",
-        taxes=30.0,
-        total=(flight_price or 420.0) + 30.0
-    ))
 
-    # Hotel (parse numeric price if possible)
-    hotel_price = 0.0
-    try:
-        hotel_text = final_itinerary.logistics.hotel_details
-        m2 = re.search(r'([0-9]+(?:\.[0-9]{1,2})?)', str(hotel_text))
-        if m2:
-            hotel_price = float(m2.group(1))
-    except Exception:
-        hotel_text = "UNVERIFIED hotel info"
-
-    items.append(BookingItem(
-        item_id="hotel-" + str(uuid.uuid4())[:8],
-        item_type="hotel",
-        description=str(hotel_text),
-        provider="mock_hotel",
-        price=hotel_price or 60.0,
-        currency="USD",
-        taxes=10.0,
-        total=(hotel_price or 60.0) + 10.0
-    ))
-
-    # Cab (estimate)
-    items.append(BookingItem(
-        item_id="cab-" + str(uuid.uuid4())[:8],
-        item_type="cab",
-        description="Airport pickup / local transfers (estimate)",
-        provider="mock_cab",
-        price=35.0,
-        currency="USD",
-        taxes=0.0,
-        total=35.0
-    ))
-
-    booking_req = BookingRequest(
-        user_id=user_id,
-        itinerary_id=getattr(final_itinerary, "destination", "itn_demo"),
-        items=items,
-        total_amount=sum(i.total for i in items),
-        currency="USD",
-        idempotency_key=str(uuid.uuid4())
-    )
-
-    # Wire mock providers
-    providers = {
-        "flight": MockFlightProvider(),
-        "hotel": MockHotelProvider(),
-        "cab": MockCabProvider(),
-    }
-
-    tm = TransactionManager(booking_req, providers)
-
-    print("\n--- Starting mocked booking flow (reserve) ---")
-    booking_after_reserve = tm.reserve_all()
-    for it in booking_after_reserve.items:
-        print(f"RESERVE: {it.item_id}: status={it.status}, hold_id={it.hold_id}, meta={it.meta}")
-
-    # Simulate payment authorization (in real app, use hosted checkout and webhooks)
-    payment_auth = {"type": "mock", "id": "paytok_demo"}
-
-    print("\n--- Confirming bookings (mock) ---")
-    booking_after_confirm = tm.confirm_all(payment_auth)
-    print("\n--- Booking result ---")
-    print("booking_request.status:", booking_after_confirm.status)
-    for it in booking_after_confirm.items:
-        print(f"FINAL: {it.item_id}: status={it.status}, confirmed_id={it.confirmed_id}, meta={it.meta}")
-
-    return booking_after_confirm
-# ---- end mock booking helper ----
-
-# --- 6. FIXED Graph (wired correctly) ---
+# ─────────────────────────────────────────────
+# 9. Graph
+# ─────────────────────────────────────────────
 workflow = StateGraph(AgentState)
 
-workflow.add_node("planner", planner_node)
-workflow.add_node("tools", ToolNode(tools))
-workflow.add_node("verifier", verifier_node)
+workflow.add_node("planner",   planner_node)
+workflow.add_node("tools",     ToolNode(tools))
+workflow.add_node("verifier",  verifier_node)
 workflow.add_node("formatter", formatter_node)
 
 workflow.set_entry_point("planner")
-workflow.add_conditional_edges("planner", router, {"tools": "tools", "formatter": "formatter"})
+workflow.add_conditional_edges("planner",  router,          {"tools": "tools", "formatter": "formatter"})
 workflow.add_edge("tools", "verifier")
 workflow.add_conditional_edges("verifier", verifier_router, {"planner": "planner", "formatter": "formatter"})
 workflow.add_edge("formatter", END)
 
 app = workflow.compile()
 
-# --- 7. Execution (Unchanged, minor robustness) ---
+
+# ─────────────────────────────────────────────
+# 10. Run
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     user_request = """
-    Plan a 3-day trip to Paris for a student.
-    Budget: Minimal.
-    Must Visit: Eiffel Tower, Louvre, Montmartre, and Versailles.
+    Plan a 3-day trip to Paris for 1 adult student.
+    Origin: DEL (New Delhi)
+    Destination: CDG (Paris)
+    Departure: 2026-04-10
+    Return: 2026-04-13
+    Budget tier: budget
+    Cabin class: ECONOMY
     """
 
-    print(f"User Request: {user_request}")
-    print("\n--- 🧠 Agent is Thinking (Checking Locations & Prices)... ---")
+    print("User Request:", user_request)
+    print("\n--- Voyage Agent Thinking... ---\n")
 
     inputs = {"messages": [HumanMessage(content=user_request)]}
 
     try:
-        # Stream progress (app.stream may yield nodes' outputs)
-        for output in app.stream(inputs):
-            for key, value in output.items():
-                print(f"✅ Finished Node: {key}")
-
         result = app.invoke(inputs)
-        print("\n--- ✅ SMART ITINERARY GENERATED ---")
-        # result["final_output"] should be a FinalItinerary Pydantic model (formatter_node ensures validation)
-        final_itinerary = result.get("final_output")
-        print(final_itinerary.model_dump_json(indent=2))
+        final = result["final_output"]
 
-        # DEMO: run mocked booking flow based on the generated itinerary
-        # (This is for testing/demo only. Replace with real booking adapters and payment flow later.)
-        run_mock_booking_for_itinerary(final_itinerary, user_id="user_demo")
+        print("\n--- FINAL ITINERARY ---")
+        if isinstance(final, dict) and "error" in final:
+            print("ERROR:", json.dumps(final, indent=2))
+        else:
+            print(final.model_dump_json(indent=2))
 
     except Exception as e:
-        print(f"\n❌ Error Occurred: {e}")
+        print(f"\nCRITICAL ERROR: {e}")
         import traceback
         traceback.print_exc()
