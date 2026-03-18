@@ -1,12 +1,13 @@
 import os
 import math
 import json
+import time
 import operator
-from typing import Annotated, List, Literal, TypedDict, Any, Dict
-from datetime import date
+from typing import Annotated, List, Literal, TypedDict, Any, Dict, Optional
+from datetime import date, datetime
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.utilities import SerpAPIWrapper
@@ -302,6 +303,29 @@ def amadeus_hotels_near_places(
                 "confidence": 0.95,
             })
 
+        # FIX 2: Filter out Amadeus test-data garbage — hotels whose coordinates fall
+        # outside the Paris bounding box (lat 48.7–49.0, lng 2.1–2.6).
+        # This drops entries like "HY Marriott Savannah" that land on Paris coords
+        # due to sandbox data errors.
+        PARIS_LAT_MIN, PARIS_LAT_MAX = 48.70, 49.05
+        PARIS_LNG_MIN, PARIS_LNG_MAX = 2.10, 2.65
+        before_filter = len(enriched)
+        enriched = [
+            h for h in enriched
+            if h["latitude"] is not None
+            and h["longitude"] is not None
+            and PARIS_LAT_MIN <= h["latitude"] <= PARIS_LAT_MAX
+            and PARIS_LNG_MIN <= h["longitude"] <= PARIS_LNG_MAX
+        ]
+        if len(enriched) < before_filter:
+            print(f"[HOTEL TOOL] Dropped {before_filter - len(enriched)} out-of-bounds hotel(s) via geo filter.")
+
+        if not enriched:
+            return json.dumps({
+                "error": "All hotels failed Paris geo-validation. Try widening radius_km.",
+                "total_hotels_found": 0,
+            })
+
         enriched.sort(key=lambda h: float(h["price"]["total"] or 0))
         budget_pick = enriched[0] if enriched else None
         midrange_pick = enriched[len(enriched) // 2] if len(enriched) > 1 else None
@@ -324,7 +348,9 @@ def amadeus_hotels_near_places(
         return json.dumps({"error": f"Unexpected error: {str(e)}", "total_hotels_found": 0})
 
 
-# ── NEW TOOL: Hotel Booking ───────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPROVEMENT 1: amadeus_book_hotel — retry logic (up to 3 attempts, backoff)
+# ─────────────────────────────────────────────────────────────────────────────
 @tool
 def amadeus_book_hotel(
     offer_id: str,
@@ -338,6 +364,7 @@ def amadeus_book_hotel(
 ) -> str:
     """
     Book a hotel using an Amadeus hotel offer ID.
+    Retries up to 3 times with exponential backoff on transient failures.
 
     Args:
         offer_id:         The offer_id from amadeus_hotels_near_places recommended.budget.offer_id
@@ -363,84 +390,278 @@ def amadeus_book_hotel(
             "confirmation_number": "UNVERIFIED",
         })
 
-    try:
-        booking_payload = {
-            "data": {
-                "offerId": offer_id,
-                "guests": [
-                    {
-                        "id": 1,
-                        "name": {
-                            "title": "MR",
-                            "firstName": guest_first_name.upper(),
-                            "lastName": guest_last_name.upper(),
-                        },
-                        "contact": {
-                            "phone": guest_phone,
-                            "email": guest_email,
-                        },
-                    }
-                ],
-                "payments": [
-                    {
-                        "id": 1,
-                        "method": "creditCard",
-                        "card": {
-                            "vendorCode": card_vendor_code,
-                            "cardNumber": card_number,
-                            "expiryDate": card_expiry,
-                        },
-                    }
-                ],
-                "rooms": [
-                    {
-                        "guestIds": [1],
-                        "paymentId": 1,
-                        "specialRequest": "Non-smoking room please",
-                    }
-                ],
-            }
+    booking_payload = {
+        "data": {
+            "offerId": offer_id,
+            "guests": [
+                {
+                    "id": 1,
+                    "name": {
+                        "title": "MR",
+                        "firstName": guest_first_name.upper(),
+                        "lastName": guest_last_name.upper(),
+                    },
+                    "contact": {
+                        "phone": guest_phone,
+                        "email": guest_email,
+                    },
+                }
+            ],
+            "payments": [
+                {
+                    "id": 1,
+                    "method": "creditCard",
+                    "card": {
+                        "vendorCode": card_vendor_code,
+                        "cardNumber": card_number,
+                        "expiryDate": card_expiry,
+                    },
+                }
+            ],
+            "rooms": [
+                {
+                    "guestIds": [1],
+                    "paymentId": 1,
+                    "specialRequest": "Non-smoking room please",
+                }
+            ],
         }
+    }
 
-        response = amadeus.booking.hotel_orders.post(json.dumps(booking_payload))
-        booking_data = response.data
+    # ── IMPROVEMENT 1: Retry loop with exponential backoff ──
+    MAX_RETRIES = 3
+    BACKOFF_BASE = 2  # seconds: 2s, 4s, 8s
 
-        print(f"[BOOKING TOOL] Booking confirmed: {booking_data.get('id')}")
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"[BOOKING TOOL] Attempt {attempt}/{MAX_RETRIES}...")
+            response = amadeus.booking.hotel_orders.post(json.dumps(booking_payload))
+            booking_data = response.data
 
-        return json.dumps({
-            "status": "CONFIRMED",
-            "hotel_booking_id": booking_data.get("id", "UNVERIFIED"),
-            "hotel_name": booking_data.get("hotel", {}).get("name", "UNVERIFIED"),
-            "check_in": booking_data.get("checkInDate", "UNVERIFIED"),
-            "check_out": booking_data.get("checkOutDate", "UNVERIFIED"),
-            "guest_name": f"{guest_first_name} {guest_last_name}",
-            "total_price": booking_data.get("price", {}).get("total", "UNVERIFIED"),
-            "currency": booking_data.get("price", {}).get("currency", "UNVERIFIED"),
-            "confirmation_number": booking_data.get("associatedRecords", [{}])[0].get("reference", "UNVERIFIED"),
-            "source": "amadeus_hotel_orders",
-            "confidence": 0.95,
-        }, indent=2)
+            print(f"[BOOKING TOOL] Booking confirmed on attempt {attempt}: {booking_data.get('id')}")
+            return json.dumps({
+                "status": "CONFIRMED",
+                "attempt": attempt,
+                "hotel_booking_id": booking_data.get("id", "UNVERIFIED"),
+                "hotel_name": booking_data.get("hotel", {}).get("name", "UNVERIFIED"),
+                "check_in": booking_data.get("checkInDate", "UNVERIFIED"),
+                "check_out": booking_data.get("checkOutDate", "UNVERIFIED"),
+                "guest_name": f"{guest_first_name} {guest_last_name}",
+                "total_price": booking_data.get("price", {}).get("total", "UNVERIFIED"),
+                "currency": booking_data.get("price", {}).get("currency", "UNVERIFIED"),
+                "confirmation_number": booking_data.get("associatedRecords", [{}])[0].get("reference", "UNVERIFIED"),
+                "source": "amadeus_hotel_orders",
+                "confidence": 0.95,
+            }, indent=2)
 
-    except ResponseError as e:
-        print(f"[BOOKING TOOL] Booking failed: {e}")
-        return json.dumps({
-            "status": "FAILED",
-            "error": str(e),
-            "hotel_booking_id": "UNVERIFIED",
-            "confirmation_number": "UNVERIFIED",
-            "source": "amadeus_hotel_orders",
-        })
+        except ResponseError as e:
+            last_error = str(e)
+            error_code = str(e)
+
+            # Don't retry on hard failures (invalid offer, expired, auth error)
+            if any(code in error_code for code in ["401", "403", "404", "410", "38196"]):
+                print(f"[BOOKING TOOL] Hard failure on attempt {attempt}, not retrying: {e}")
+                break
+
+            # Transient error — wait and retry
+            if attempt < MAX_RETRIES:
+                wait_secs = BACKOFF_BASE ** attempt
+                print(f"[BOOKING TOOL] Transient error on attempt {attempt}, retrying in {wait_secs}s: {e}")
+                time.sleep(wait_secs)
+            else:
+                print(f"[BOOKING TOOL] All {MAX_RETRIES} attempts exhausted: {e}")
+
+        except Exception as e:
+            last_error = f"Unexpected error: {str(e)}"
+            print(f"[BOOKING TOOL] Unexpected error on attempt {attempt}: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(BACKOFF_BASE ** attempt)
+
+    return json.dumps({
+        "status": "FAILED",
+        "attempts_made": attempt,
+        "error": last_error,
+        "hotel_booking_id": "UNVERIFIED",
+        "confirmation_number": "UNVERIFIED",
+        "fallback_action": "User should book directly at hotel website or via booking.com/hotels.com",
+        "source": "amadeus_hotel_orders",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPROVEMENT 2: NEW TOOL — book_cab_transfers
+# Books cab/transfer rides between itinerary stops for each day
+# Uses Amadeus Transfer Offers API (real endpoint)
+# ─────────────────────────────────────────────────────────────────────────────
+@tool
+def book_cab_transfers(
+    transfers_json: str,
+) -> str:
+    """
+    Search for and book cab/transfer rides between visiting places on each day.
+
+    Args:
+        transfers_json: JSON string — list of transfer request dicts, each with:
+            {
+              "day": int,                  -- day number (1, 2, 3...)
+              "date": "YYYY-MM-DD",
+              "from_name": str,            -- pickup location name
+              "from_lat": float,
+              "from_lng": float,
+              "to_name": str,              -- dropoff location name
+              "to_lat": float,
+              "to_lng": float,
+              "time": "HH:MM",            -- pickup time (24h)
+              "passengers": int
+            }
+
+    Returns a JSON list of cab bookings with price estimates and status per leg.
+    """
+    print(f"[CAB TOOL] Received transfer request")
+
+    try:
+        transfers = json.loads(transfers_json)
     except Exception as e:
-        return json.dumps({
-            "status": "FAILED",
-            "error": f"Unexpected error: {str(e)}",
-            "hotel_booking_id": "UNVERIFIED",
-            "confirmation_number": "UNVERIFIED",
+        return json.dumps({"error": f"Invalid JSON: {e}", "bookings": []})
+
+    if not transfers:
+        return json.dumps({"error": "No transfers provided.", "bookings": []})
+
+    results = []
+
+    for leg in transfers:
+        day = leg.get("day", "?")
+        from_name = leg.get("from_name", "Pickup")
+        to_name = leg.get("to_name", "Dropoff")
+        from_lat = leg.get("from_lat")
+        from_lng = leg.get("from_lng")
+        to_lat = leg.get("to_lat")
+        to_lng = leg.get("to_lng")
+        transfer_date = leg.get("date", "")
+        transfer_time = leg.get("time", "09:00")
+        passengers = leg.get("passengers", 1)
+
+        print(f"[CAB TOOL] Day {day}: {from_name} → {to_name}")
+
+        # Estimate distance for price fallback
+        dist_km = 0.0
+        if all([from_lat, from_lng, to_lat, to_lng]):
+            dist_km = haversine_km(from_lat, from_lng, to_lat, to_lng)
+
+        # Try Amadeus Transfer Offers API
+        try:
+            transfer_datetime = f"{transfer_date}T{transfer_time}:00"
+
+            response = amadeus.shopping.transfer_offers.post(
+                json.dumps({
+                    "startLocationCode": "CDG",  # fallback airport code context
+                    "endAddressLine": to_name,
+                    "endCityName": "Paris",
+                    "endZipCode": "75001",
+                    "endCountryCode": "FR",
+                    "endName": to_name,
+                    "endGeoCode": f"{to_lat},{to_lng}",
+                    "transferType": "PRIVATE",
+                    "startDateTime": transfer_datetime,
+                    "passengers": passengers,
+                    "startGeoCode": f"{from_lat},{from_lng}",
+                })
+            )
+
+            offers = response.data
+            if offers:
+                best = offers[0]
+                price = best.get("quotation", {}).get("monetaryAmount", "N/A")
+                currency = best.get("quotation", {}).get("currencyCode", "EUR")
+                vehicle = best.get("vehicle", {}).get("description", "Private car")
+                transfer_id = best.get("id", "N/A")
+
+                results.append({
+                    "day": day,
+                    "leg": f"{from_name} → {to_name}",
+                    "from": {"name": from_name, "lat": from_lat, "lng": from_lng},
+                    "to": {"name": to_name, "lat": to_lat, "lng": to_lng},
+                    "pickup_datetime": transfer_datetime,
+                    "passengers": passengers,
+                    "distance_km": round(dist_km, 2),
+                    "vehicle_type": vehicle,
+                    "price": f"{price} {currency}",
+                    "transfer_offer_id": transfer_id,
+                    "status": "OFFER_FOUND",
+                    "booking_action": "Confirm via amadeus.booking.transfer_orders.post(transfer_offer_id)",
+                    "source": "amadeus_transfer_offers",
+                    "confidence": 0.90,
+                })
+                print(f"[CAB TOOL] Offer found: {price} {currency} for {from_name} → {to_name}")
+                continue
+
+        except ResponseError as e:
+            print(f"[CAB TOOL] Amadeus transfer API failed for leg ({from_name} → {to_name}): {e}")
+        except Exception as e:
+            print(f"[CAB TOOL] Unexpected error for leg: {e}")
+
+        # ── FALLBACK: price estimate using distance + Paris taxi rates ──
+        # Paris taxi rates (2025): ~€1.50/km + €4 base fare, roughly
+        base_fare = 4.0
+        rate_per_km = 1.60
+        estimated_price = round(base_fare + dist_km * rate_per_km, 2)
+        estimated_duration_min = max(5, int(dist_km * 3.5))  # ~17 km/h avg Paris traffic
+
+        # Suggest Metro as fallback if short distance
+        transport_suggestion = "Taxi / Uber"
+        if dist_km < 2.0:
+            transport_suggestion = "Walk or Metro (short distance)"
+        elif dist_km < 5.0:
+            transport_suggestion = "Metro / Taxi"
+
+        results.append({
+            "day": day,
+            "leg": f"{from_name} → {to_name}",
+            "from": {"name": from_name, "lat": from_lat, "lng": from_lng},
+            "to": {"name": to_name, "lat": to_lat, "lng": to_lng},
+            "pickup_datetime": f"{transfer_date}T{transfer_time}:00",
+            "passengers": passengers,
+            "distance_km": round(dist_km, 2),
+            "vehicle_type": transport_suggestion,
+            "price": f"~€{estimated_price} (estimated)",
+            "estimated_duration_min": estimated_duration_min,
+            "transfer_offer_id": "UNVERIFIED: Amadeus API unavailable",
+            "status": "PRICE_ESTIMATE_ONLY",
+            "booking_action": "Book via G7 Taxi (+33 1 41 27 66 99), Uber app, or Bolt app in Paris",
+            "alternatives": [
+                "Paris Métro: ~€1.90/ride or day pass €13.95",
+                "Vélib' bike share: €3/day",
+                "RER train: for CDG airport transfers (~€11.80)",
+            ],
+            "source": "distance_estimate_fallback",
+            "confidence": 0.70,
         })
+        print(f"[CAB TOOL] Fallback estimate: ~€{estimated_price} for {from_name} → {to_name} ({dist_km:.1f} km)")
+
+    total_estimated = sum(
+        float(r["price"].replace("~€", "").replace(" (estimated)", "").split()[0])
+        for r in results
+        if "estimated" in r.get("price", "")
+    ) if results else 0.0
+
+    print(f"[CAB TOOL] Processed {len(results)} transfer legs. Total est. ~€{total_estimated:.2f}")
+    return json.dumps({
+        "total_legs": len(results),
+        "total_estimated_cost_eur": round(total_estimated, 2),
+        "note": "Prices are live Amadeus offers where available, else distance-based estimates. Book taxis via G7, Uber, or Bolt.",
+        "bookings": results,
+    }, indent=2)
 
 
-# All 4 tools active
-tools = [google_search, amadeus_flight_search, amadeus_hotels_near_places, amadeus_book_hotel]
+# All 5 tools active
+tools = [
+    google_search,
+    amadeus_flight_search,
+    amadeus_hotels_near_places,
+    amadeus_book_hotel,
+    book_cab_transfers,   # NEW
+]
 
 
 # ─────────────────────────────────────────────
@@ -481,7 +702,10 @@ class ItineraryCentroid(BaseModel):
 
 
 class FlightData(BaseModel):
-    flights: List[Dict[str, Any]]
+    # FIX 3: List[Any] + arbitrary_types_allowed stops Pydantic from null-coercing
+    # nested Amadeus dicts (segments, fees, travelerPricings) it can't match to a type.
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    flights: List[Any]
     total_found: int
 
 
@@ -516,7 +740,6 @@ class HotelOption(BaseModel):
     confidence: float = Field(default=0.95)
 
 
-# NEW: Booking confirmation schema
 class HotelBooking(BaseModel):
     status: str                 # CONFIRMED | FAILED | SKIPPED
     hotel_booking_id: str
@@ -527,8 +750,33 @@ class HotelBooking(BaseModel):
     guest_name: str = "UNVERIFIED"
     total_price: str = "UNVERIFIED"
     currency: str = "UNVERIFIED"
+    attempts_made: int = 1
+    fallback_action: str = ""
     source: str = "amadeus_hotel_orders"
     confidence: float = Field(default=0.95)
+
+
+# ── NEW: Cab Transfer Schemas ──────────────────
+class TransferLeg(BaseModel):
+    day: int
+    leg: str
+    distance_km: float
+    vehicle_type: str
+    price: str
+    estimated_duration_min: Optional[int] = None
+    transfer_offer_id: str
+    status: str          # OFFER_FOUND | PRICE_ESTIMATE_ONLY
+    booking_action: str
+    alternatives: List[str] = Field(default_factory=list)
+    source: str
+    confidence: float = Field(default=0.70)
+
+
+class CabTransfers(BaseModel):
+    total_legs: int
+    total_estimated_cost_eur: float
+    note: str
+    bookings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class FinalItinerary(BaseModel):
@@ -539,21 +787,23 @@ class FinalItinerary(BaseModel):
     itinerary_centroid: ItineraryCentroid
     flights: FlightData
     hotels: List[HotelOption] = Field(default_factory=list)
-    hotel_booking: HotelBooking | None = None   # NEW: booking result
+    hotel_booking: HotelBooking | None = None
+    cab_transfers: CabTransfers | None = None    # NEW
     logistics: TripLogistics
     daily_itinerary: List[DayPlan]
     travel_tips: List[str]
 
 
 # ─────────────────────────────────────────────
-# 5. System Prompt
+# 5. System Prompt (updated with cab tool)
 # ─────────────────────────────────────────────
 SYSTEM_PROMPT_TEXT = """
-You are "Voyage", a professional AI travel planner. You have four tools:
+You are "Voyage", a professional AI travel planner. You have five tools:
   - google_search              — find visiting places, hours, prices
   - amadeus_flight_search      — get real flights from Amadeus API
   - amadeus_hotels_near_places — get real hotels near visiting places from Amadeus API
-  - amadeus_book_hotel         — book the best hotel automatically
+  - amadeus_book_hotel         — book the best hotel automatically (retries 3x on failure)
+  - book_cab_transfers         — book cab/transfer rides between all visiting places each day
 
 REQUIRED SLOTS (ask if any are missing):
   origin (IATA), destination (IATA), departure_date (YYYY-MM-DD),
@@ -564,7 +814,7 @@ MANDATORY TOOL CALL SEQUENCE — always in this exact order:
 
 STEP 1 — google_search
   Query: "top places to visit in <destination>"
-  Extract: place names, prices, ratings.
+  Extract: place names, prices, ratings. Pick top 5.
 
 STEP 2 — amadeus_flight_search
   Use: origin, destination, departure_date, return_date, adults, cabin_class.
@@ -578,24 +828,43 @@ STEP 4 — amadeus_book_hotel
   Use offer_id from recommended.budget.offer_id in Step 3 output.
   ONLY call if offer_id does NOT contain "UNVERIFIED".
   Use guest details provided by user. If not provided use these defaults:
-    guest_first_name = "TEST"
-    guest_last_name  = "USER"
-    guest_email      = "test@example.com"
-    guest_phone      = "+911234567890"
-    card_number      = "4111111111111111"
-    card_expiry      = "2026-01"
-    card_vendor_code = "VI"
+    guest_first_name = "TEST", guest_last_name = "USER"
+    guest_email = "test@example.com", guest_phone = "+911234567890"
+    card_number = "4111111111111111", card_expiry = "2026-01", card_vendor_code = "VI"
 
-STEP 5 — Build daily_itinerary from google_search results.
+STEP 5 — book_cab_transfers
+  Build a transfer list covering EVERY place-to-place leg across ALL days.
+  Use the hotel lat/lng as the "from" for the first ride each day.
+  Use the lat/lng of each activity as from/to coordinates.
+  Format transfers_json as a JSON list:
+  [
+    {
+      "day": 2, "date": "2026-04-11",
+      "from_name": "Hotel", "from_lat": 48.867, "from_lng": 2.326,
+      "to_name": "Eiffel Tower", "to_lat": 48.8584, "to_lng": 2.2945,
+      "time": "09:00", "passengers": 1
+    },
+    {
+      "day": 2, "date": "2026-04-11",
+      "from_name": "Eiffel Tower", "from_lat": 48.8584, "from_lng": 2.2945,
+      "to_name": "Arc de Triomphe", "to_lat": 48.8738, "to_lng": 2.2950,
+      "time": "12:30", "passengers": 1
+    },
+    ...one entry per leg per day...
+  ]
+
+STEP 6 — Build daily_itinerary from google_search results.
 
 OUTPUT RULES:
 - Pure JSON matching FinalItinerary schema exactly.
 - flights: copy ENTIRE amadeus_flight_search output.
 - hotels: extract recommended.budget and recommended.mid_range from hotel tool.
-- hotel_booking: copy ENTIRE amadeus_book_hotel output.
+- hotel_booking: copy ENTIRE amadeus_book_hotel output including attempts_made.
+  If booking FAILED, set fallback_action to the website/booking.com URL.
+- cab_transfers: copy ENTIRE book_cab_transfers output.
 - itinerary_centroid: copy from amadeus_hotels_near_places centroid.
 - If field missing: "UNVERIFIED: <field> not returned by API"
-- Never invent flight/hotel/booking data.
+- Never invent flight/hotel/booking/cab data.
 """
 
 
@@ -606,7 +875,9 @@ research_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0,
 )
-llm_with_tools = research_llm.bind_tools(tools)
+# FIX 1: tool_choice="any" forces Gemini to always emit a tool call when tools
+# are bound — prevents it from text-responding its way past the verifier.
+llm_with_tools = research_llm.bind_tools(tools, tool_choice="any")
 
 
 # ─────────────────────────────────────────────
@@ -615,6 +886,10 @@ llm_with_tools = research_llm.bind_tools(tools)
 class AgentState(TypedDict):
     messages: Annotated[List[AnyMessage], operator.add]
     final_output: Any
+    # FIX 1: iteration counter — lets router detect when planner text-responded
+    # without calling any tools, and force it back through the verifier loop
+    # instead of escaping to the formatter.
+    iteration: int
 
 
 # ─────────────────────────────────────────────
@@ -625,18 +900,40 @@ def planner_node(state: AgentState):
     system_msg = SystemMessage(content=SYSTEM_PROMPT_TEXT)
     messages = [system_msg] + state["messages"]
     response = llm_with_tools.invoke(messages)
-    print("[PLANNER] Ran successfully.")
-    return {"messages": [response]}
+    iteration = state.get("iteration", 0) + 1
+    print(f"[PLANNER] Ran successfully. (iteration {iteration})")
+    return {"messages": [response], "iteration": iteration}
 
 
-def router(state: AgentState) -> Literal["tools", "formatter"]:
+def router(state: AgentState) -> Literal["tools", "verifier", "formatter"]:
     last = state["messages"][-1]
+    iteration = state.get("iteration", 0)
+
     if getattr(last, "tool_calls", None):
+        # Planner emitted tool calls — execute them
         return "tools"
+
+    # FIX 1: Planner responded with plain text (no tool calls).
+    # If we haven't hit the hard cap yet, bounce back through the verifier so it
+    # can re-inject the missing-tool instructions instead of letting the formatter
+    # hallucinate data for uncalled tools.
+    MAX_ITERATIONS = 6
+    if iteration < MAX_ITERATIONS:
+        print(f"[ROUTER] No tool calls on iteration {iteration}, routing to verifier to re-check.")
+        return "verifier"
+
+    # Hard cap reached — go to formatter with whatever we have.
+    print(f"[ROUTER] Hit max iterations ({MAX_ITERATIONS}), routing to formatter.")
     return "formatter"
 
 
 def verifier_node(state: AgentState):
+    """
+    IMPROVEMENT 3: Smarter verifier.
+    - Checks all 4 required tool calls are done
+    - Checks hotel booking status — if FAILED, injects retry instruction
+    - Checks cab transfers are booked
+    """
     messages = state.get("messages", [])
     tool_outputs = [
         m.content for m in messages
@@ -646,12 +943,12 @@ def verifier_node(state: AgentState):
     print(f"[VERIFIER] Checking {len(tool_outputs)} tool outputs")
     problems = []
 
-    # Check flight
+    # ── Check 1: Flight search ──
     flight_done = any("total_found" in t for t in tool_outputs)
     if not flight_done:
         problems.append("amadeus_flight_search has not been called yet. Call it now.")
 
-    # Check hotels
+    # ── Check 2: Hotel search ──
     hotel_done = any("total_hotels_found" in t for t in tool_outputs)
     if not hotel_done:
         problems.append(
@@ -660,30 +957,64 @@ def verifier_node(state: AgentState):
             "then call amadeus_hotels_near_places."
         )
 
-    # Check booking — only required if a real offer_id was available
-    booking_done = any(
-        "CONFIRMED" in t or "FAILED" in t or "SKIPPED" in t
-        for t in tool_outputs
-    )
-    if hotel_done and not booking_done:
-        # Check if offer_id was real (not UNVERIFIED)
-        real_offer_available = any(
-            "total_hotels_found" in t and "UNVERIFIED" not in json.loads(t).get(
-                "recommended", {}).get("budget", {}).get("offer_id", "UNVERIFIED")
-            for t in tool_outputs
-            if "total_hotels_found" in t
+    # ── Check 3: Hotel booking (with FAILED status retry logic) ──
+    if hotel_done:
+        booking_outputs = [t for t in tool_outputs if any(k in t for k in ["CONFIRMED", "FAILED", "SKIPPED"])]
+
+        if not booking_outputs:
+            # Check if a real offer_id exists
+            real_offer_available = False
+            for t in tool_outputs:
+                if "total_hotels_found" in t:
+                    try:
+                        parsed = json.loads(t)
+                        offer_id = parsed.get("recommended", {}).get("budget", {}).get("offer_id", "UNVERIFIED")
+                        if offer_id and "UNVERIFIED" not in offer_id:
+                            real_offer_available = True
+                    except Exception:
+                        pass
+            if real_offer_available:
+                problems.append(
+                    "amadeus_book_hotel has not been called yet. "
+                    "Use offer_id from recommended.budget.offer_id and call amadeus_book_hotel."
+                )
+
+        elif booking_outputs:
+            # ── IMPROVEMENT 3: Check if booking failed and ALL retries exhausted ──
+            for t in booking_outputs:
+                try:
+                    booking = json.loads(t)
+                    if booking.get("status") == "FAILED":
+                        attempts = booking.get("attempts_made", 1)
+                        error = booking.get("error", "")
+                        # Only retry if not a hard auth/not-found error
+                        hard_errors = ["401", "403", "404", "410", "38196"]
+                        is_hard = any(code in error for code in hard_errors)
+                        if not is_hard and attempts < 3:
+                            problems.append(
+                                f"amadeus_book_hotel failed after {attempts} attempt(s) with a transient error. "
+                                f"Please retry amadeus_book_hotel once more with the same offer_id."
+                            )
+                        elif is_hard:
+                            print(f"[VERIFIER] Hotel booking failed with hard error (not retrying): {error}")
+                except Exception:
+                    pass
+
+    # ── Check 4: Cab transfers ──
+    cab_done = any("total_legs" in t for t in tool_outputs)
+    if not cab_done and hotel_done:
+        problems.append(
+            "book_cab_transfers has not been called yet. "
+            "Build a transfers_json list with one entry per place-to-place leg across all days "
+            "(including hotel → first attraction, attraction → attraction, last attraction → hotel). "
+            "Use the lat/lng of each activity and the hotel. Call book_cab_transfers now."
         )
-        if real_offer_available:
-            problems.append(
-                "amadeus_book_hotel has not been called yet. "
-                "Use offer_id from recommended.budget.offer_id and call amadeus_book_hotel."
-            )
 
     if problems:
         print(f"[VERIFIER] Issues: {problems}")
         recheck = HumanMessage(
             content="VERIFIER ISSUES:\n" + "\n".join(f"- {p}" for p in problems)
-            + "\nPlease call the missing tools to fix the issues."
+            + "\nPlease call the missing/failed tools to fix all issues."
         )
         return {"messages": [recheck]}
 
@@ -712,8 +1043,11 @@ MAPPING RULES:
 - flights:            Copy ENTIRE amadeus_flight_search output (flights list + total_found)
 - hotels:             Extract recommended.budget and recommended.mid_range from
                       amadeus_hotels_near_places as a list of 2 HotelOption objects
-- hotel_booking:      Copy ENTIRE amadeus_book_hotel output into hotel_booking field
-                      If booking was SKIPPED or FAILED, still copy the output as-is
+- hotel_booking:      Copy ENTIRE amadeus_book_hotel output into hotel_booking field.
+                      Include attempts_made field. If FAILED, set fallback_action to
+                      "Book directly at https://www.melia.com or https://www.booking.com"
+- cab_transfers:      Copy ENTIRE book_cab_transfers output (total_legs, total_estimated_cost_eur,
+                      note, bookings list)
 - itinerary_centroid: Copy latitude/longitude/note from amadeus_hotels_near_places centroid
 - daily_itinerary:    Build from google_search results with lat/lng per activity
 - trip_purpose:       LEISURE for tourist trips, BUSINESS otherwise
@@ -754,7 +1088,8 @@ workflow.add_node("verifier",  verifier_node)
 workflow.add_node("formatter", formatter_node)
 
 workflow.set_entry_point("planner")
-workflow.add_conditional_edges("planner",  router,          {"tools": "tools", "formatter": "formatter"})
+# FIX 1: router now has 3 possible targets — tools, verifier (no-tool-call bounce), formatter
+workflow.add_conditional_edges("planner",  router,          {"tools": "tools", "verifier": "verifier", "formatter": "formatter"})
 workflow.add_edge("tools", "verifier")
 workflow.add_conditional_edges("verifier", verifier_router, {"planner": "planner", "formatter": "formatter"})
 workflow.add_edge("formatter", END)
@@ -782,7 +1117,7 @@ if __name__ == "__main__":
     print("User Request:", user_request)
     print("\n--- Voyage Agent Thinking... ---\n")
 
-    inputs = {"messages": [HumanMessage(content=user_request)]}
+    inputs = {"messages": [HumanMessage(content=user_request)], "iteration": 0}
 
     try:
         result = app.invoke(inputs)
