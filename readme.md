@@ -40,7 +40,7 @@ python phase3_agent.py
 Plan 3-day Paris trip: DEL→CDG, 2026-04-10→13, 1 adult, budget/economy, John Doe
 ```
 
-## 📊 **Sample Output: FinalItinerary JSON** (Recruiter Showcase)
+## 📊 **Sample Output: FinalItinerary JSON** 
 
 ```json
 {
